@@ -60,6 +60,25 @@ python configs/olmoearth_base.py launch <run_name> ai2/jupiter \
 config/env-driven (`OLMOEARTH2_H5_DIR`); no hardcoded paths live outside
 `olmoearth2/launch/`.
 
+## Inference
+
+Convert a training checkpoint (olmo-core DCP) to an inference export — the online
+encoder only, with the frozen target encoder + predictor stripped:
+
+```bash
+python -m olmoearth2.tools.convert_checkpoint \
+    /weka/.../rope_simple_v1/step125000  /path/to/export
+```
+
+Then load it with **core deps only** (no olmo-core / flash-attn; SDPA path):
+
+```python
+from olmoearth2.inference import load_encoder_from_path
+encoder = load_encoder_from_path("/path/to/export")   # config.json + weights.pth
+```
+
+Published models load by ID: `load_model_from_id(ModelID.OLMOEARTH_V1_BASE)`.
+
 ## Test
 
 ```bash
