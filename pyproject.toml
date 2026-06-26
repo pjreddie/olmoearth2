@@ -36,6 +36,9 @@ training = [
     "albumentations>=1.4.10",
     "cartopy>=0.25.0",
     "class-registry>=2.1.2",
+    # class-registry imports pkg_resources at import time but doesn't declare it;
+    # fresh uv venvs don't ship setuptools, so pin it explicitly.
+    "setuptools>=70",
     "gcsfs>=2025.9.0",
     "hdf5plugin>=6.0.0",
     "matplotlib>=3.10.7",
