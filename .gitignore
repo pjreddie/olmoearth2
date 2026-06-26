@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Envs
+.venv/
+venv/
+.env
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Experiment outputs
+local_output/
+wandb/
+*.log
+checkpoints/
+
+# Editor
+*.swp
+.DS_Store
+.cursor/
+run_logs/

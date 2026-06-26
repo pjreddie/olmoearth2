@@ -1,0 +1,235 @@
+"""Breizhcrops eval dataset."""
+
+from logging import getLogger
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from einops import repeat
+from torch.utils.data import ConcatDataset, Dataset
+
+from olmoearth2.train.masking import (
+    MaskedOlmoEarthSample,
+    Modality,
+    OlmoEarthSample,
+)
+
+from .constants import EVAL_S2_BAND_NAMES, EVAL_TO_OLMOEARTH_S2_BANDS
+from .normalize import normalize_bands
+from .utils import load_min_max_stats
+
+LEVEL = "L1C"
+
+logger = getLogger(__name__)
+
+
+def _olmoearth2bc_name(band_name: str) -> str:
+    """Transform OlmoEarth Pretrain S2 band name to Breizhcrops S2 band name."""
+    band_number = band_name.split(" ")[0]
+    if band_number.startswith("0"):
+        band_number = band_number[1:]
+    return f"B{band_number}"
+
+
+BAND_STATS = {
+    "01 - Coastal aerosol": {"mean": 3254.1433, "std": 2148.5647},
+    "02 - Blue": {"mean": 288.4604, "std": 544.2625},
+    "03 - Green": {"mean": 2729.1228, "std": 1146.0743},
+    "04 - Red": {"mean": 1857.3398, "std": 985.2388},
+    "05 - Vegetation Red Edge": {"mean": 2999.3413, "std": 2194.9316},
+    "06 - Vegetation Red Edge": {"mean": 2742.9236, "std": 2055.1450},
+    "07 - Vegetation Red Edge": {"mean": 2749.7593, "std": 2285.5239},
+    "08 - NIR": {"mean": 2992.1721, "std": 2134.8782},
+    "08A - Vegetation Red Edge": {"mean": 3702.4248, "std": 1794.7379},
+    "09 - Water vapour": {"mean": 4056.3201, "std": 1752.6676},
+    "10 - SWIR - Cirrus": {"mean": 3914.2307, "std": 1649.3500},
+    "11 - SWIR": {"mean": 4290.2134, "std": 11693.7297},
+    "12 - SWIR": {"mean": 1697.6628, "std": 1239.9095},
+}
+
+
+class BreizhCropsDataset(Dataset):
+    """The Breizhcrops dataset."""
+
+    def __init__(
+        self,
+        path_to_splits: Path,
+        split: str,
+        label_fraction: float = 1.0,
+        norm_stats_from_pretrained: bool = False,
+        # Default to 2std no clip - this matches what our model sees in pretraining,
+        # so when using dataset stats (e.g. for MADOS) consistency is important.
+        norm_method: str = "norm_no_clip_2_std",
+        monthly_average: bool = True,
+    ):
+        """The Breizhcrops dataset.
+
+        https://isprs-archives.copernicus.org/articles/XLIII-B2-2020/1545/2020/
+        isprs-archives-XLIII-B2-2020-1545-2020.pdf
+
+        We partitioned all acquired field parcels
+        according to the NUTS-3 regions and suggest to subdivide the
+        dataset into training (FRH01, FRH02), validation (FRH03), and
+        evaluation (FRH04) subsets based on these spatially distinct
+        regions.
+
+        Args:
+            path_to_splits: Path where .pt objects returned by process_mados have been saved
+            split: Split to use
+            label_fraction: Fraction of train labels to use; only 1.0 is currently supported
+            norm_stats_from_pretrained: Whether to use normalization stats from pretrained model
+            norm_method: Normalization method to use, only when norm_stats_from_pretrained is False
+            monthly_average: Whether to compute a monthly average of the timesteps
+        """
+        try:
+            from breizhcrops import BreizhCrops
+            from breizhcrops.datasets.breizhcrops import SELECTED_BANDS
+        except ImportError:
+            raise RuntimeError(
+                "breizhcrops package must be explicitly installed "
+                "(`uv pip install breizhcrops==0.0.4.1`) for the "
+                "Breizhcrops eval to run."
+            )
+
+        self.bc_selected_bands = SELECTED_BANDS
+
+        self.input_to_output_band_mapping = [
+            SELECTED_BANDS[LEVEL].index(_olmoearth2bc_name(b))
+            for b in EVAL_S2_BAND_NAMES
+        ]
+        kwargs = {
+            "root": path_to_splits,
+            "preload_ram": False,
+            "level": LEVEL,
+            "transform": raw_transform,
+            "target_transform": default_target_transform,
+        }
+        # belle-ille is small, so its useful for testing
+        assert split in ["train", "valid", "test", "belle-ile"]
+        if split == "train":
+            self.ds: Dataset = ConcatDataset(
+                [BreizhCrops(region=r, **kwargs) for r in ["frh01", "frh02"]]
+            )
+        elif split == "valid":
+            self.ds = BreizhCrops(region="frh03", **kwargs)
+        elif split == "test":
+            self.ds = BreizhCrops(region="frh04", **kwargs)
+        else:
+            self.ds = BreizhCrops(region="belle-ile", **kwargs)
+        self.monthly_average = monthly_average
+
+        self.min_max_stats = load_min_max_stats()["breizhcrops"]
+        # Merge BAND_STATS and min/max stats
+        minmax = self.min_max_stats["sentinel2_l2a"]
+        merged_band_stats = {
+            band_name: {
+                **(
+                    {k: BAND_STATS[band_name][k] for k in ("mean", "std")}
+                    if band_name in BAND_STATS
+                    else {}
+                ),
+                **(
+                    {k: minmax[band_name][k] for k in ("min", "max")}
+                    if band_name in minmax
+                    else {}
+                ),
+            }
+            for band_name in EVAL_S2_BAND_NAMES
+        }
+        self.means, self.stds, self.mins, self.maxs = self._get_norm_stats(
+            merged_band_stats
+        )
+        if label_fraction != 1.0:
+            raise NotImplementedError(
+                f"label_fraction {label_fraction} not implemented yet for BreizhCrops"
+            )
+
+        self.norm_stats_from_pretrained = norm_stats_from_pretrained
+        self.norm_method = norm_method
+        # If normalize with pretrained stats, we initialize the normalizer here
+        if self.norm_stats_from_pretrained:
+            from olmoearth2.data.normalize import Normalizer, Strategy
+
+            self.normalizer_computed = Normalizer(Strategy.COMPUTED)
+
+    @staticmethod
+    def _get_norm_stats(
+        imputed_band_info: dict[str, dict[str, float]],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        means = []
+        stds = []
+        mins = []
+        maxs = []
+        for band_name in EVAL_S2_BAND_NAMES:
+            assert band_name in imputed_band_info, f"{band_name} not found in band_info"
+            means.append(imputed_band_info[band_name]["mean"])  # type: ignore
+            stds.append(imputed_band_info[band_name]["std"])  # type: ignore
+            mins.append(imputed_band_info[band_name]["min"])  # type: ignore
+            maxs.append(imputed_band_info[band_name]["max"])  # type: ignore
+        return np.array(means), np.array(stds), np.array(mins), np.array(maxs)
+
+    def __len__(self) -> int:
+        """Length of the dataset."""
+        return len(self.ds)
+
+    def __getitem__(self, idx: int) -> tuple[MaskedOlmoEarthSample, torch.Tensor]:
+        """Return a Breizhcrops instance."""
+        x, y_true, _ = self.ds[idx]
+        if self.monthly_average:
+            x = self._average_over_month(x)  # T, C
+        months = torch.from_numpy(x[:, self.bc_selected_bands[LEVEL].index("doa")])
+        days = torch.ones_like(months)
+        # from the Breizhcrops paper: The dataset is composed of Sentinel-2 image time series
+        # extracted from January 1, 2017 to December 31, 2017
+        years = torch.ones_like(months) * 2017
+        timestamp = torch.stack([days, months, years], dim=-1)  # t, c=3
+        if not self.norm_stats_from_pretrained:
+            # The first 13 bands are the S2 bands so to apply stats we first filter to those
+            x = x[:, : len(BAND_STATS)]
+            x = normalize_bands(
+                x, self.means, self.stds, self.mins, self.maxs, self.norm_method
+            )
+        image = repeat(x, "t c -> h w t c", w=1, h=1)[
+            :,
+            :,
+            :,
+            self.input_to_output_band_mapping,
+        ][:, :, :, EVAL_TO_OLMOEARTH_S2_BANDS]
+        if self.norm_stats_from_pretrained:
+            image = self.normalizer_computed.normalize(Modality.SENTINEL2_L2A, image)
+
+        masked_sample = MaskedOlmoEarthSample.from_olmoearthsample(
+            OlmoEarthSample(
+                sentinel2_l2a=torch.tensor(image).float(), timestamps=timestamp.long()
+            )
+        )
+        return masked_sample, y_true.long()
+
+    def _average_over_month(self, x: np.ndarray) -> np.ndarray:
+        # doa == date of acquisition
+        x[:, self.bc_selected_bands[LEVEL].index("doa")] = np.array(
+            [
+                t.month - 1
+                for t in pd.to_datetime(
+                    x[:, self.bc_selected_bands[LEVEL].index("doa")]
+                )
+            ]
+        )
+        per_month = np.split(
+            x,
+            np.unique(
+                x[:, self.bc_selected_bands[LEVEL].index("doa")], return_index=True
+            )[1],
+        )[1:]
+        return np.array([per_month[idx].mean(axis=0) for idx in range(len(per_month))])
+
+
+def raw_transform(input_timeseries: np.ndarray) -> np.ndarray:
+    """A raw transform, for the Breizhcrops transforms."""
+    return input_timeseries
+
+
+def default_target_transform(y: np.ndarray) -> torch.Tensor:
+    """The default label transform, for the Breizhcrops labels."""
+    return torch.tensor(y, dtype=torch.long)

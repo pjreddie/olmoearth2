@@ -1,0 +1,2926 @@
+"""Model code for the OlmoEarth Pretrain model."""
+
+import logging
+import math
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+from einops import rearrange, reduce, repeat
+from torch import Tensor, nn
+from torch.distributed.fsdp import fully_shard
+
+from olmoearth2.config import Config
+from olmoearth2.data.constants import (
+    BASE_GSD,
+    Modality,
+    ModalitySpec,
+    get_modality_specs_from_names,
+)
+from olmoearth2.datatypes import (
+    MaskedOlmoEarthSample,
+    MaskValue,
+    TokensAndMasks,
+)
+from olmoearth2.model.attention import Block
+from olmoearth2.model.encodings import (
+    get_1d_sincos_pos_encoding,
+    get_2d_sincos_pos_encoding_with_resolution,
+    get_month_encoding_table,
+    get_simple_latlon_encoding,
+    get_simple_temporal_encoding,
+    get_static_latlon_encoding,
+    get_static_temporal_encoding,
+)
+from olmoearth2.model.flexi_patch_embed import (
+    FlexiPatchEmbed,
+    FlexiPatchReconstruction,
+)
+from olmoearth2.model.pooling import PoolingType, pool_unmasked_tokens
+from olmoearth2.model.tokenization import TokenizationConfig
+from olmoearth2.model.utils import get_cumulative_sequence_lengths
+
+logger = logging.getLogger(__name__)
+
+SPATIAL_POS_ENCODING_TYPES = ("absolute", "rope", "rope_mixed", "none")
+ENCODING_MODES = ("additive", "separate")
+
+
+ENCODING_TYPES = ("multifreq", "simple")
+
+
+def _validate_separate_encoding_fields(
+    encoding_mode: str,
+    channel_dim: int,
+    temporal_dim: int,
+    latlon_dim: int,
+    latlon_dropout_rate: float,
+    temporal_encoding_type: str = "multifreq",
+    latlon_encoding_type: str = "multifreq",
+) -> None:
+    """Validate the separate-encoding fields used by ``SeparateEncodings``."""
+    if encoding_mode not in ENCODING_MODES:
+        raise ValueError(
+            f"encoding_mode must be one of {ENCODING_MODES}, got {encoding_mode}"
+        )
+    if temporal_encoding_type not in ENCODING_TYPES:
+        raise ValueError(
+            f"temporal_encoding_type must be one of {ENCODING_TYPES}, "
+            f"got {temporal_encoding_type}"
+        )
+    if latlon_encoding_type not in ENCODING_TYPES:
+        raise ValueError(
+            f"latlon_encoding_type must be one of {ENCODING_TYPES}, "
+            f"got {latlon_encoding_type}"
+        )
+    if min(channel_dim, temporal_dim, latlon_dim) < 0:
+        raise ValueError("encoding dims must be non-negative")
+    if temporal_dim > 0:
+        if temporal_encoding_type == "simple" and temporal_dim != 3:
+            raise ValueError(
+                f"simple temporal encoding requires temporal_encoding_dim=3, "
+                f"got {temporal_dim}"
+            )
+        if temporal_encoding_type == "multifreq" and temporal_dim % 2 != 0:
+            raise ValueError(f"temporal_encoding_dim must be even, got {temporal_dim}")
+    if latlon_dim > 0:
+        if latlon_encoding_type == "simple" and latlon_dim != 3:
+            raise ValueError(
+                f"simple latlon encoding requires latlon_encoding_dim=3, "
+                f"got {latlon_dim}"
+            )
+        if latlon_encoding_type == "multifreq" and latlon_dim % 6 != 0:
+            raise ValueError(
+                f"latlon_encoding_dim must be divisible by 6, got {latlon_dim}"
+            )
+    if not 0.0 <= latlon_dropout_rate <= 1.0:
+        raise ValueError(
+            f"latlon_dropout_rate must be in [0, 1], got {latlon_dropout_rate}"
+        )
+    if encoding_mode == "additive" and (
+        channel_dim or temporal_dim or latlon_dim or latlon_dropout_rate
+    ):
+        raise ValueError(
+            "channel/temporal/latlon_encoding_dim and latlon_dropout_rate must be "
+            "zero unless encoding_mode='separate'"
+        )
+
+
+def get_modalities_to_process(
+    available_modalities: list[str], supported_modality_names: list[str]
+) -> list[str]:
+    """Get the modalities to process."""
+    modalities_to_process = set(supported_modality_names).intersection(
+        set(available_modalities)
+    )
+    return list(modalities_to_process)
+
+
+def return_modalities_from_dict(
+    per_modality_input_tokens: dict[str, Tensor],
+) -> list[str]:
+    """Return the modalities from a dictionary of per modality input tokens."""
+    return [
+        key for key in per_modality_input_tokens.keys() if not key.endswith("_mask")
+    ]
+
+
+# TokensAndMasks is imported from datatypes and re-exported here for backwards compatibility
+# See olmoearth2.datatypes.TokensAndMasks for the implementation
+
+
+class ProjectAndAggregate(nn.Module):
+    """Module that applies a linear projection to tokens and masks."""
+
+    def __init__(
+        self,
+        embedding_size: int,
+        num_layers: int,
+        aggregate_then_project: bool = True,
+        output_embedding_size: int | None = None,
+        only_project: bool = False,
+    ):
+        """Initialize the linear module.
+
+        embedding_size: The embedding size of the input TokensAndMasks
+        num_layers: The number of layers to use in the projection. If >1, then
+            a ReLU activation will be applied between layers
+        aggregate_then_project: If True, then we will average the tokens before applying
+            the projection. If False, we will apply the projection first.
+        output_embedding_size: If provided, the final layer will output this size instead
+            of embedding_size.
+        only_project: If True, only project the tokens without aggregation.
+        """
+        super().__init__()
+        self.only_project = only_project
+        out_size = (
+            output_embedding_size
+            if output_embedding_size is not None
+            else embedding_size
+        )
+        # Build projection layers: all intermediate layers use embedding_size, final uses out_size
+        if num_layers == 1:
+            projections = [nn.Linear(embedding_size, out_size)]
+        else:
+            projections = [nn.Linear(embedding_size, embedding_size)]
+            for _ in range(1, num_layers - 1):
+                projections.append(nn.ReLU())
+                projections.append(nn.Linear(embedding_size, embedding_size))
+            projections.append(nn.ReLU())
+            projections.append(nn.Linear(embedding_size, out_size))
+        self.projection = nn.Sequential(*projections)
+        self.aggregate_then_project = aggregate_then_project
+
+    def apply_aggregate_then_project(
+        self, x: TokensAndMasks | torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the aggregate operation to the input."""
+        if isinstance(x, TokensAndMasks):
+            pooled_for_contrastive = pool_unmasked_tokens(
+                x, PoolingType.MEAN, spatial_pooling=False
+            )
+        elif isinstance(x, torch.Tensor):
+            pooled_for_contrastive = reduce(x, "b ... d -> b  d", "mean")
+        else:
+            raise ValueError(f"Invalid input type: {type(x)}")
+        return self.projection(pooled_for_contrastive)
+
+    def apply_project_then_aggregate(
+        self, x: TokensAndMasks | torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the project operation to the input then aggregate."""
+        if isinstance(x, TokensAndMasks):
+            decoder_emedded_dict = x.as_dict(include_nones=True)
+            for modality in x.modalities:
+                x_modality = getattr(x, modality)
+                # Are these normalizations masked correctly?
+                x_modality = self.projection(x_modality)
+                masked_modality_name = x.get_masked_modality_name(modality)
+                decoder_emedded_dict[modality] = x_modality
+                decoder_emedded_dict[masked_modality_name] = getattr(
+                    x, masked_modality_name
+                )
+            x_projected = TokensAndMasks(**decoder_emedded_dict)
+            projected_pooled = pool_unmasked_tokens(
+                x_projected, PoolingType.MEAN, spatial_pooling=False
+            )
+        elif isinstance(x, torch.Tensor):
+            x_projected = self.projection(x)
+            projected_pooled = reduce(x_projected, "b ... d -> b  d", "mean")
+        else:
+            raise ValueError(f"Invalid input type: {type(x)}")
+        return projected_pooled
+
+    def apply_project_only(
+        self, x: TokensAndMasks | torch.Tensor
+    ) -> TokensAndMasks | torch.Tensor:
+        """Apply projection without aggregation, preserving token structure."""
+        if isinstance(x, TokensAndMasks):
+            decoder_emedded_dict = x._asdict()
+            for modality in x.modalities:
+                x_modality = getattr(x, modality)
+                x_modality = self.projection(x_modality)
+                masked_modality_name = x.get_masked_modality_name(modality)
+                decoder_emedded_dict[modality] = x_modality
+                decoder_emedded_dict[masked_modality_name] = getattr(
+                    x, masked_modality_name
+                )
+            return TokensAndMasks(**decoder_emedded_dict)
+        elif isinstance(x, torch.Tensor):
+            return self.projection(x)
+        else:
+            raise ValueError(f"Invalid input type: {type(x)}")
+
+    def forward(
+        self, x: TokensAndMasks | torch.Tensor
+    ) -> torch.Tensor | TokensAndMasks:
+        """Apply a (non)linear projection to an input TokensAndMasks.
+
+        This can be applied either before or after pooling the tokens.
+        If only_project is True, returns projected tokens without aggregation.
+        """
+        if self.only_project:
+            return self.apply_project_only(x)
+        elif self.aggregate_then_project:
+            return self.apply_aggregate_then_project(x)
+        else:
+            return self.apply_project_then_aggregate(x)
+
+
+class MultiModalPatchEmbeddings(nn.Module):
+    """Module that patchifies and encodes the input data for multiple modalities."""
+
+    def __init__(
+        self,
+        supported_modality_names: list[str],
+        max_patch_size: int,
+        embedding_size: int,
+        tokenization_config: TokenizationConfig | None = None,
+        use_linear_patch_embed: bool = True,
+        band_dropout_rate: float = 0.0,
+        random_band_dropout: bool = False,
+        band_dropout_modalities: list[str] | None = None,
+        patch_embed_hidden_sizes: list[int] | None = None,
+        post_proj_hidden_sizes: list[int] | None = None,
+    ):
+        """Initialize the patch embeddings.
+
+        Args:
+            supported_modality_names: Which modalities from Modality this model
+                instantiation supports
+            max_patch_size: Maximum size of patches
+            embedding_size: Size of embeddings
+            tokenization_config: Optional config for custom band groupings
+            use_linear_patch_embed: Passed through to FlexiPatchEmbed. Set False to load
+                checkpoints trained before this flag existed (which used Conv2d).
+            band_dropout_rate: Probability of dropping each band channel during training.
+                When > 0, randomly zeroes out bands before the patch embedding Conv2d,
+                forcing the model to learn cross-spectral representations. Only active
+                during training (self.training=True). Default: 0.0 (no dropout).
+            random_band_dropout: If True, sample the dropout rate per forward call from
+                Uniform(0, band_dropout_rate). This reduces train-inference mismatch
+                and acts as stronger augmentation. Default: False (fixed rate).
+            band_dropout_modalities: If provided, only apply band dropout to these
+                modalities. If None, apply to all modalities. Default: None.
+            patch_embed_hidden_sizes: Optional list of hidden layer widths for a
+                per-pixel MLP applied BEFORE patchification in the spatial
+                FlexiPatchEmbed. If None or empty, the projection is a single nn.Linear
+                over the flattened patch (current behavior). Otherwise, each pixel's
+                channel vector is mapped via an MLP with ReLU activations (weights
+                shared across all pixels), producing an H x W x h[-1] feature map
+                that is then patchified and projected to embedding_size. Only applies
+                to the spatial branch (FlexiPatchEmbed); the non-spatial nn.Linear
+                branch is unaffected.
+            post_proj_hidden_sizes: Optional list of hidden layer widths for an MLP
+                applied AFTER the patch projection. Each entry adds a
+                ReLU -> Linear(prev, h) layer, applied before the norm. Only applies
+                to the spatial branch (FlexiPatchEmbed).
+        """
+        super().__init__()
+        self.max_patch_size = max_patch_size
+        self.embedding_size = embedding_size
+        self.supported_modality_names = supported_modality_names
+        self.tokenization_config = tokenization_config or TokenizationConfig()
+        self.use_linear_patch_embed = use_linear_patch_embed
+        self.band_dropout_rate = band_dropout_rate
+        self.random_band_dropout = random_band_dropout
+        self.band_dropout_modalities = band_dropout_modalities
+        self.patch_embed_hidden_sizes = patch_embed_hidden_sizes
+        self.post_proj_hidden_sizes = post_proj_hidden_sizes
+        # TODO: want to be able to remove certain bands and modalities
+        self.per_modality_embeddings = nn.ModuleDict({})
+
+        for modality in self.supported_modality_names:
+            self.per_modality_embeddings[modality] = (
+                self._get_patch_embedding_module_for_modality(modality)
+            )
+
+        # For every patch embedding module we want to create a unique buffer
+        # for selecting the correct band indices from the data tensor
+        for modality in self.supported_modality_names:
+            for idx, bandset_indices in enumerate(
+                self.tokenization_config.get_bandset_indices(modality)
+            ):
+                buffer_name = self._get_buffer_name(modality, idx)
+                banset_indices_tensor = torch.tensor(bandset_indices, dtype=torch.long)
+                self.register_buffer(
+                    buffer_name, banset_indices_tensor, persistent=False
+                )
+
+        # Create a dictionary of per modality index tensors to do  index select with registered buffer
+
+    @staticmethod
+    def _get_buffer_name(modality: str, idx: int) -> str:
+        """Get the buffer name."""
+        return f"{modality}__{idx}_buffer"
+
+    @staticmethod
+    def _get_embedding_module_name(modality: str, idx: int) -> str:
+        """Get the embedding module name.
+
+        Module Dicts require string keys
+        """
+        return f"{modality}__{idx}"
+
+    def _get_patch_embedding_module_for_modality(self, modality: str) -> nn.Module:
+        """Get the patch embedding module for a modality."""
+        modality_spec = Modality.get(modality)
+        # Get bandset indices from tokenization config (may be overridden)
+        bandset_indices = self.tokenization_config.get_bandset_indices(modality)
+
+        # Based on the modality name we choose the way to embed the data
+        # I likely will need to know about what the embedding strategy is in the forward as well
+        # Static modality
+        if not modality_spec.is_spatial:
+            # static in space
+            return nn.ModuleDict(
+                {
+                    self._get_embedding_module_name(modality, idx): nn.Linear(
+                        len(channel_set_idxs), self.embedding_size
+                    )
+                    for idx, channel_set_idxs in enumerate(bandset_indices)
+                }
+            )
+        else:
+            return nn.ModuleDict(
+                {
+                    self._get_embedding_module_name(modality, idx): FlexiPatchEmbed(
+                        in_chans=len(channel_set_idxs),
+                        embedding_size=self.embedding_size,
+                        base_patch_size_at_16=self.max_patch_size,
+                        modality_spec=modality_spec,
+                        use_linear_patch_embed=self.use_linear_patch_embed,
+                        patch_embed_hidden_sizes=self.patch_embed_hidden_sizes,
+                        post_proj_hidden_sizes=self.post_proj_hidden_sizes,
+                    )
+                    for idx, channel_set_idxs in enumerate(bandset_indices)
+                }
+            )
+
+    def apply_embedding_to_modality(
+        self,
+        modality: str,
+        input_data: MaskedOlmoEarthSample,
+        patch_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Apply embedding to a modality."""
+        logger.debug(f"applying embedding to modality:{modality}")
+        masked_modality_name = input_data.get_masked_modality_name(modality)
+        modality_mask = getattr(input_data, masked_modality_name)
+        modality_data = getattr(input_data, modality)
+
+        modality_spec = Modality.get(modality)
+        num_band_sets = self.tokenization_config.get_num_bandsets(modality)
+
+        modality_tokens, modality_masks = [], []
+        for idx in range(num_band_sets):
+            modality_specific_kwargs = {}
+            if not modality_spec.is_spatial:
+                # static in time
+                token_mask = modality_mask[..., idx]
+            else:
+                token_mask = modality_mask[
+                    :,
+                    0 :: patch_size * modality_spec.image_tile_size_factor,
+                    0 :: patch_size * modality_spec.image_tile_size_factor,
+                    ...,
+                    idx,
+                ]
+                modality_specific_kwargs = {"patch_size": patch_size}
+
+            buffer_name = self._get_buffer_name(modality, idx)
+            inp_data = torch.index_select(modality_data, -1, getattr(self, buffer_name))
+
+            # Check if we should apply band dropout for this bandset
+            apply_dropout = (
+                self.band_dropout_modalities is None
+                or modality in self.band_dropout_modalities
+            )
+            if self.training and apply_dropout and self.band_dropout_rate > 0.0:
+                num_bands = inp_data.shape[-1]
+                # Only apply band dropout if there are more than 1 band
+                if num_bands > 1:
+                    if self.random_band_dropout:
+                        rate = (
+                            torch.rand(1, device=inp_data.device).item()
+                            * self.band_dropout_rate
+                        )
+                    else:
+                        rate = self.band_dropout_rate
+                    inp_data = self._apply_band_dropout(inp_data, rate)
+
+            embedding_module = self.per_modality_embeddings[modality][
+                self._get_embedding_module_name(modality, idx)
+            ]
+            patchified_data = embedding_module(inp_data, **modality_specific_kwargs)
+
+            modality_tokens.append(patchified_data)
+            modality_masks.append(token_mask)
+        return torch.stack(modality_tokens, dim=-2), torch.stack(modality_masks, dim=-1)
+
+    @staticmethod
+    def _apply_band_dropout(patchified_data: Tensor, rate: float) -> Tensor:
+        """Randomly zero out band channels to force cross-spectral learning.
+
+        Args:
+            patchified_data: Input tensor with bands in the last dimension.
+            rate: Probability of dropping each band (per sample).
+
+        Returns:
+            Tensor with randomly zeroed bands, at least 1 band kept per sample.
+        """
+        num_bands = patchified_data.shape[-1]
+        batch_size = patchified_data.shape[0]
+        keep_mask = (
+            torch.rand(batch_size, num_bands, device=patchified_data.device) >= rate
+        )
+        # If no bands are kept, randomly select one band to keep
+        no_bands_kept = ~keep_mask.any(dim=1)
+        if no_bands_kept.any():
+            rand_idx = torch.randint(
+                num_bands, (no_bands_kept.sum(),), device=keep_mask.device
+            )
+            keep_mask[no_bands_kept, rand_idx] = True
+        # Broadcast: [B, 1, 1, ..., num_bands]
+        view_shape = [batch_size] + [1] * (patchified_data.dim() - 2) + [num_bands]
+        return patchified_data * keep_mask.view(*view_shape).to(patchified_data.dtype)
+
+    @staticmethod
+    def is_any_data_seen_by_encoder(modality_mask: Tensor) -> bool:
+        """Check if any data is seen by the encoder."""
+        return (MaskValue.ONLINE_ENCODER.value == modality_mask).any()
+
+    def apply_compile(self) -> None:
+        """Apply torch.compile to the model."""
+        self.compile(dynamic=False, mode="max-autotune-no-cudagraphs", fullgraph=True)
+
+    def forward(
+        self,
+        input_data: MaskedOlmoEarthSample,
+        patch_size: int,
+    ) -> dict[str, Tensor]:
+        """Return flexibly patchified embeddings for each modality of the input data.
+
+        Given a [B, H, W, (T), C] inputs, returns a [B, H, W, (T), b_s, D] output.
+
+        We assume that the spatial masks are consistent for the given patch size,
+        so that if patch_size == 2 then one possible mask would be
+        [0, 0, 1, 1]
+        [0, 0, 1, 1]
+        [1, 1, 0, 0]
+        [1, 1, 0, 0]
+        for the H, W dimensions
+        """
+        output_dict = {}
+        modalities_to_process = get_modalities_to_process(
+            input_data.modalities, self.supported_modality_names
+        )
+        for modality in modalities_to_process:
+            modality_tokens, modality_masks = self.apply_embedding_to_modality(
+                modality, input_data, patch_size
+            )
+            output_dict[modality] = modality_tokens
+            modality_mask_name = input_data.get_masked_modality_name(modality)
+            output_dict[modality_mask_name] = modality_masks
+        return output_dict
+
+
+class Reconstructor(nn.Module):
+    """Module that patchifies and encodes the input data."""
+
+    def __init__(
+        self,
+        decoder: nn.Module,
+        supported_modalities: list[ModalitySpec],
+        max_patch_size: int,
+        tokenization_config: TokenizationConfig | None = None,
+    ):
+        """Initialize the patch embeddings.
+
+        Args:
+            decoder: Predictor nn module to use on before reconstructor on input
+            supported_modalities: Which modalities from Modality this model
+                instantiation supports
+            max_patch_size: Maximum size of patches
+            tokenization_config: Optional config for custom band groupings
+        """
+        super().__init__()
+        self.max_patch_size = max_patch_size
+        self.embedding_size = decoder.output_embedding_size
+        self.supported_modalities = supported_modalities
+        self.tokenization_config = tokenization_config or TokenizationConfig()
+        self.decoder = decoder
+        # TODO: want to be able to remove certain bands and modalities
+        self.per_modality_reconstructions = nn.ModuleDict({})
+        for modality in self.supported_modalities:
+            self.per_modality_reconstructions[modality.name] = (
+                self._get_patch_reconstruction_module_for_modality(modality)
+            )
+
+    def apply_compile(self) -> None:
+        """Apply torch.compile to the model."""
+        self.decoder.apply_compile()
+
+    def apply_fsdp(self, **fsdp_kwargs: Any) -> None:
+        """Apply FSDP to the model."""
+        self.decoder.apply_fsdp(**fsdp_kwargs)
+
+    @staticmethod
+    def _get_reconstruction_module_name(modality: str, idx: int) -> str:
+        """Get the reconstruction module name.
+
+        Module Dicts require string keys
+        """
+        return f"{modality}__{idx}"
+
+    def _get_patch_reconstruction_module_for_modality(
+        self, modality: ModalitySpec
+    ) -> nn.Module:
+        """Get the patch reconstruction module for a modality."""
+        # Get bandset indices from tokenization config (may be overridden)
+        bandset_indices = self.tokenization_config.get_bandset_indices(modality.name)
+
+        # Based on the modality name we choose the way to embed the data
+        # I likely will need to know about what the embedding strategy is in the forward as well
+        # Static modality
+        if modality.get_tile_resolution() == 0:
+            # static in space
+            return nn.ModuleDict(
+                {
+                    self._get_reconstruction_module_name(modality.name, idx): nn.Linear(
+                        self.embedding_size, len(channel_set_idxs)
+                    )
+                    for idx, channel_set_idxs in enumerate(bandset_indices)
+                }
+            )
+        else:
+            return nn.ModuleDict(
+                {
+                    self._get_reconstruction_module_name(
+                        modality.name, idx
+                    ): FlexiPatchReconstruction(
+                        out_chans=len(channel_set_idxs),
+                        embedding_size=self.embedding_size,
+                        max_patch_size=self.max_patch_size,
+                    )
+                    for idx, channel_set_idxs in enumerate(bandset_indices)
+                }
+            )
+
+    # TODO: Likely we want a single object that stores all the data related configuration etc per modality including channel grous bands patch size etc
+    def apply_reconstruction_to_modality(
+        self, modality: str, input_data: TokensAndMasks, patch_size: int
+    ) -> tuple[Tensor, Tensor]:
+        """Apply reconstruction to a modality."""
+        masked_modality_name = input_data.get_masked_modality_name(modality)
+        modality_mask = getattr(input_data, masked_modality_name)
+        modality_data = getattr(input_data, modality)
+
+        modality_spec = Modality.get(modality)
+        bandset_indices = self.tokenization_config.get_bandset_indices(modality)
+
+        # x: Input tensor with shape [b, h, w, (t), b_s, d]
+        modality_tokens, modality_masks = [], []
+        for idx, channel_set_indices in enumerate(bandset_indices):
+            data = modality_data[..., idx, :]
+            masks = modality_mask[..., idx]
+            r_model = self.per_modality_reconstructions[modality][
+                self._get_reconstruction_module_name(modality, idx)
+            ]
+            if modality_spec.get_tile_resolution() == 0:
+                data = r_model(data)
+            else:
+                data = r_model(data, patch_size=patch_size)
+            modality_tokens.append(data)
+            masks = repeat(
+                masks,
+                "b h w ... -> b (h p_h) (w p_w) ...",
+                p_h=patch_size,
+                p_w=patch_size,
+            )
+            modality_masks.append(masks)
+        modality_mask = repeat(
+            modality_mask,
+            "b h w ... -> b (h p_h) (w p_w) ...",
+            p_h=patch_size,
+            p_w=patch_size,
+        )
+        return torch.cat(modality_tokens, dim=-1), modality_mask
+
+    def forward(
+        self,
+        x: TokensAndMasks,
+        timestamps: Tensor,
+        patch_size: int,
+        input_res: int = BASE_GSD,
+    ) -> TokensAndMasks:
+        """Return flexibly patchified reconstruction for each modality of the input data.
+
+        Given a [B, H, W, (T), b_s, D] inputs, returns a [B, H, W, (T), C] output.
+        """
+        input_data = self.decoder(x, timestamps, patch_size, input_res)
+        output_dict = {}
+        modalities_to_process = get_modalities_to_process(
+            input_data.modalities, [m.name for m in self.supported_modalities]
+        )
+        for modality in modalities_to_process:
+            modality_tokens, modality_masks = self.apply_reconstruction_to_modality(
+                modality, input_data, patch_size
+            )
+            output_dict[modality] = modality_tokens
+            modality_mask_name = input_data.get_masked_modality_name(modality)
+            output_dict[modality_mask_name] = modality_masks
+        return TokensAndMasks(**output_dict)
+
+
+@dataclass
+class ReconstructorConfig(Config):
+    """Configuration for the Reconstructor."""
+
+    decoder_config: "Config"
+    supported_modality_names: list[str]
+    max_patch_size: int = 8
+    tokenization_config: TokenizationConfig | None = None
+
+    def __post_init__(self) -> None:
+        """Coerce raw dicts to TokenizationConfig for old checkpoint compatibility."""
+        if isinstance(self.tokenization_config, dict):
+            self.tokenization_config = TokenizationConfig(**self.tokenization_config)
+
+    def validate(self) -> None:
+        """Validate the configuration."""
+        if len(self.supported_modalities) == 0:
+            raise ValueError("At least one modality must be added!")
+        else:
+            for modality in self.supported_modalities:
+                if modality not in Modality.values():
+                    raise ValueError(f"Modality {modality} is not supported")
+        if self.tokenization_config is not None:
+            self.tokenization_config.validate()
+
+    @property
+    def supported_modalities(self) -> list[ModalitySpec]:
+        """Get the supported modalities."""
+        return get_modality_specs_from_names(self.supported_modality_names)
+
+    def build(self) -> "Reconstructor":
+        """Build the reconstructor."""
+        self.validate()
+        kwargs = self.as_dict(exclude_none=True, recurse=False)
+        kwargs.pop("supported_modality_names")
+        kwargs["supported_modalities"] = self.supported_modalities
+        kwargs.pop("decoder_config")
+        kwargs["decoder"] = self.decoder_config.build()
+        logger.info(f"Predictor kwargs: {kwargs}")
+        return Reconstructor(**kwargs)
+
+
+class CompositeEncodings(nn.Module):
+    """Composite encodings for FlexiVit models."""
+
+    def __init__(
+        self,
+        embedding_size: int,
+        supported_modalities: list[ModalitySpec],
+        max_sequence_length: int,
+        learnable_channel_embeddings: bool = True,
+        random_channel_embeddings: bool = False,
+        tokenization_config: TokenizationConfig | None = None,
+        spatial_pos_encoding: str = "absolute",
+    ):
+        """Initialize the composite encodings.
+
+        Args:
+            embedding_size: Size of token embeddings
+            supported_modalities: Which modalities from Modality this model
+                instantiation supports
+            max_sequence_length: Maximum sequence length
+            learnable_channel_embeddings: Whether to use learnable channel embeddings
+            random_channel_embeddings: Initialize channel embeddings randomly (zeros if False)
+            tokenization_config: Optional config for custom band groupings
+            spatial_pos_encoding: Spatial encoding type: "absolute", "rope",
+                "rope_mixed", or "none"
+        """
+        super().__init__()
+        if spatial_pos_encoding not in SPATIAL_POS_ENCODING_TYPES:
+            raise ValueError(
+                f"spatial_pos_encoding must be one of {SPATIAL_POS_ENCODING_TYPES}, "
+                f"got {spatial_pos_encoding}"
+            )
+        self.embedding_size = embedding_size
+        self.supported_modalities = supported_modalities
+        self.supported_modality_names = [
+            modality.name for modality in supported_modalities
+        ]
+        self.tokenization_config = tokenization_config or TokenizationConfig()
+        self.spatial_pos_encoding = spatial_pos_encoding
+        self.embedding_size = embedding_size
+        self.max_sequence_length = (
+            max_sequence_length  # This max sequence length is a time dim thing
+        )
+        # TODO: we need to be able to calculate the size of the param based on what types of embeddings it will get
+
+        # we have 4 embeddings types (pos_in_time, pos_in_space, month, channel) so each get
+        # 0.25 of the dimension
+        self.embedding_dim_per_embedding_type = int(embedding_size * 0.25)
+        # Position encodings for time dimension initialized to 1D sinusoidal encodings
+        self.pos_embed = nn.Parameter(
+            get_1d_sincos_pos_encoding(
+                torch.arange(max_sequence_length),
+                self.embedding_dim_per_embedding_type,
+            ),
+            requires_grad=False,
+        )
+        # Month encodings
+        month_tab = get_month_encoding_table(self.embedding_dim_per_embedding_type)
+        self.month_embed = nn.Embedding.from_pretrained(month_tab, freeze=True)
+        if not learnable_channel_embeddings and not random_channel_embeddings:
+            self.per_modality_channel_embeddings = nn.ParameterDict()
+            for modality in self.supported_modalities:
+                num_bandsets = self.tokenization_config.get_num_bandsets(modality.name)
+                shape = (num_bandsets, self.embedding_dim_per_embedding_type)
+                channel_embeddings = nn.Parameter(
+                    torch.zeros(shape), requires_grad=False
+                )
+                self.per_modality_channel_embeddings[modality.name] = channel_embeddings
+        else:
+            # Channel embeddings
+            if learnable_channel_embeddings:
+                args = {"requires_grad": True}
+            else:
+                args = {"requires_grad": False}
+
+            self.per_modality_channel_embeddings = nn.ParameterDict()
+            for modality in self.supported_modalities:
+                num_bandsets = self.tokenization_config.get_num_bandsets(modality.name)
+                shape = (num_bandsets, self.embedding_dim_per_embedding_type)
+                if random_channel_embeddings:
+                    channel_embeddings = nn.Parameter(torch.rand(shape), **args)
+                else:
+                    channel_embeddings = nn.Parameter(torch.zeros(shape), **args)
+                self.per_modality_channel_embeddings[modality.name] = channel_embeddings
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m: nn.Module) -> None:
+        if getattr(m, "_skip_custom_init", False):
+            return
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                # TODO: fix the dtype here
+                nn.init.constant_(m.bias, 0).to(torch.float32)
+
+    @staticmethod
+    def calculate_gsd_ratio(input_res: float, patch_size: int) -> float:
+        """Calculate the Ground Sample Distance ratio."""
+        return input_res * patch_size / BASE_GSD
+
+    def _apply_encodings_per_modality(
+        self,
+        modality_name: str,
+        modality_tokens: Tensor,
+        timestamps: Tensor | None = None,
+        patch_size: int | None = None,
+        input_res: int | None = None,
+        use_modality_encodings: bool = True,
+        use_temporal_encodings: bool = True,
+    ) -> Tensor:
+        """Apply the encodings to the patchified data based on modality type.
+
+        Args:
+            modality_name: Name of the modality being processed
+            modality_tokens: Token embeddings for the modality
+            timestamps: Optional timestamps for temporal encodings
+            patch_size: Optional patch size for spatial encodings
+            input_res: Optional input resolution for spatial encodings
+            use_modality_encodings: Whether to use modality encodings
+            use_temporal_encodings: Whether to use temporal encodings
+
+        Returns:
+            Tensor with encodings applied based on modality type
+        """
+        logger.debug(
+            f"use_modality_encodings: {use_modality_encodings}, use_temporal_encodings: {use_temporal_encodings}"
+        )
+        # TODO: Improve this implementation it is quite bad
+
+        modality = Modality.get(modality_name)
+        logger.debug(f"Applying encodings to modality {modality}")
+        if not use_modality_encodings and use_temporal_encodings:
+            b, h, w, t, _ = modality_tokens.shape
+            ein_string, ein_dict = (
+                "b h w t d",
+                {"b": b, "h": h, "w": w, "t": t},
+            )
+        elif not use_temporal_encodings and not use_modality_encodings:
+            b, h, w, _ = modality_tokens.shape
+            ein_string, ein_dict = (
+                "b h w d",
+                {"b": b, "h": h, "w": w},
+            )
+        elif not use_temporal_encodings and use_modality_encodings:
+            raise NotImplementedError("Not implemented")
+        else:
+            if modality_tokens.ndim == 3:
+                # modality_tokens = [B, Band_Sets, D]; static in space, static in time
+                b, b_s, _ = modality_tokens.shape
+                ein_string, ein_dict = "b b_s d", {"b": b, "b_s": b_s}
+            elif modality_tokens.ndim == 4:
+                b, t, b_s, _ = modality_tokens.shape
+                ein_string, ein_dict = "b t b_s d", {"b": b, "t": t, "b_s": b_s}
+            elif modality_tokens.ndim == 5:
+                b, h, w, b_s, _ = modality_tokens.shape
+                ein_string, ein_dict = (
+                    "b h w b_s d",
+                    {"b": b, "h": h, "w": w, "b_s": b_s},
+                )
+            elif modality_tokens.ndim == 6:
+                b, h, w, t, b_s, _ = modality_tokens.shape
+                ein_string, ein_dict = (
+                    "b h w t b_s d",
+                    {"b": b, "h": h, "w": w, "t": t, "b_s": b_s},
+                )
+            else:
+                raise ValueError(f"Unsupported tokens shape: {modality_tokens.shape}")
+
+        device = modality_tokens.device
+        modality_embed = torch.zeros(modality_tokens.shape, device=device)
+        n = self.embedding_dim_per_embedding_type
+        actual_bandsets = modality_tokens.shape[-2]
+
+        # Channel embeddings
+        if use_modality_encodings:
+            channel_embed = self.per_modality_channel_embeddings[modality.name]
+            if channel_embed.shape[0] != actual_bandsets:
+                raise ValueError(
+                    f"Channel embeddings for {modality.name} expect "
+                    f"{channel_embed.shape[0]} bandsets but tokens have "
+                    f"{actual_bandsets}. Ensure tokenization_config is "
+                    "consistently passed to the encoder/decoder and masking strategy."
+                )
+            channel_embed = repeat(
+                channel_embed, f"b_s d -> {ein_string}", **ein_dict
+            ).to(device)
+            modality_embed[..., :n] += channel_embed
+
+        if modality.is_multitemporal and use_temporal_encodings:
+            # Time position encodings
+            time_embed = repeat(self.pos_embed[:t], f"t d -> {ein_string}", **ein_dict)
+            modality_embed[..., n : n * 2] += time_embed.to(device)
+
+            # Month encodings
+            assert timestamps is not None
+            months = timestamps[:, :, 1]
+            month_embed = self.month_embed(months)
+            month_embed = repeat(month_embed, f"b t d -> {ein_string}", **ein_dict)
+            modality_embed[..., n * 2 : n * 3] += month_embed.to(device)
+        if modality.is_spatial and self.spatial_pos_encoding == "absolute":
+            # Spatial encodings
+            assert input_res is not None
+            assert patch_size is not None
+            gsd_ratio = self.calculate_gsd_ratio(input_res, patch_size)
+            spatial_embed = get_2d_sincos_pos_encoding_with_resolution(
+                grid_size=(h, w),
+                res=torch.ones(b, device=device) * gsd_ratio,
+                encoding_dim=self.embedding_dim_per_embedding_type,
+                device=device,
+            )
+            spatial_embed = rearrange(spatial_embed, "b (h w) d -> b h w d", h=h, w=w)
+            spatial_embed = repeat(
+                spatial_embed, f"b h w d -> {ein_string}", **ein_dict
+            )
+            modality_embed[..., n * 3 : n * 4] += spatial_embed
+        return modality_tokens + modality_embed
+
+    def forward(
+        self,
+        per_modality_input_tokens: dict[str, Tensor],
+        timestamps: Tensor,
+        patch_size: int,
+        input_res: int = BASE_GSD,
+        latlon: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Apply the encodings to the patchified data.
+
+        Args:
+            per_modality_input_tokens: Tokens only for each modality
+            timestamps: Timestamps of the data
+            patch_size: Size of patches
+            input_res: Resolution of the input data
+            latlon: Ignored by the additive composite encodings; accepted for
+                interface parity with ``SeparateEncodings``.
+
+        Returns:
+            Tokens only for each modality
+        """
+        del latlon  # not used by additive flow
+        output_dict = {}
+        available_modalities = return_modalities_from_dict(per_modality_input_tokens)
+        modalities_to_process = get_modalities_to_process(
+            available_modalities, self.supported_modality_names
+        )
+        for modality_name in modalities_to_process:
+            output_dict[modality_name] = self._apply_encodings_per_modality(
+                modality_name,
+                per_modality_input_tokens[modality_name],
+                timestamps=timestamps,
+                patch_size=patch_size,
+                input_res=input_res,
+            )
+        return output_dict
+
+
+class SeparateEncodings(nn.Module):
+    """Encodings that live on a separate path from the image patch projection.
+
+    The patch-projection (image) path and the encoding path are concatenated
+    and fused by a single linear layer to ``embedding_size``. There is no
+    additive mixing of encodings into image tokens.
+
+    The encoding side packs three signals into ``enc_dim`` channels:
+      * ``[:channel_dim]``  -- learnable per-modality, per-bandset channel
+        embedding (modality identity).
+      * ``[channel_dim:channel_dim+temporal_dim]`` -- static multi-frequency
+        sin/cos of fractional year (``static_temporal``). Zero for
+        non-multitemporal modalities.
+      * ``[channel_dim+temporal_dim:]`` -- static sphere-mapped multi-frequency
+        sin/cos of tile-center lat/lon (``static_latlon``), broadcast across
+        all spatial/temporal/bandset axes. Subject to ``latlon_dropout_rate``:
+        per-sample bernoulli zeroing during training; ``rate >= 1.0`` zeros
+        in both training and eval (ablation switch matching ``latlon=None``).
+
+    Spatial position is **not** added here -- it is handled by RoPE at
+    attention time when ``spatial_pos_encoding in {'rope', 'rope_mixed'}``.
+    """
+
+    def __init__(
+        self,
+        embedding_size: int,
+        supported_modalities: list[ModalitySpec],
+        tokenization_config: TokenizationConfig | None,
+        channel_dim: int,
+        temporal_dim: int,
+        latlon_dim: int,
+        latlon_dropout_rate: float = 0.0,
+        learnable_channel_embeddings: bool = True,
+        random_channel_embeddings: bool = False,
+        temporal_encoding_type: str = "multifreq",
+        latlon_encoding_type: str = "multifreq",
+    ) -> None:
+        """Initialize the separate-encoding token builder + combiner.
+
+        Args:
+            embedding_size: Output token dimension after the combine projection.
+            supported_modalities: Modalities this instance handles.
+            tokenization_config: Bandset layout for the channel embeddings.
+            channel_dim: Width of the per-modality, per-bandset learnable
+                channel embedding (set ``0`` to omit).
+            temporal_dim: Width of the temporal encoding slot. ``0`` omits the
+                slot. For ``temporal_encoding_type='multifreq'`` must be even;
+                for ``'simple'`` must be exactly 3.
+            latlon_dim: Width of the lat/lon encoding slot. ``0`` omits the
+                slot. For ``latlon_encoding_type='multifreq'`` must be
+                divisible by 6; for ``'simple'`` must be exactly 3.
+            latlon_dropout_rate: Per-sample probability of zeroing the latlon
+                slot at training time. ``rate >= 1.0`` zeros the latlon slot
+                in both training and eval (ablation switch). Default 0.
+            learnable_channel_embeddings: If True, channel embeddings are
+                trainable. If False, frozen at init values.
+            random_channel_embeddings: If True, init channel embeddings from
+                ``torch.rand``; otherwise zeros.
+            temporal_encoding_type: ``'multifreq'`` (multi-frequency sin/cos of
+                fractional year) or ``'simple'`` ([frac_year, sin, cos], dim 3).
+            latlon_encoding_type: ``'multifreq'`` (sphere-mapped multi-frequency
+                sin/cos) or ``'simple'`` (raw unit-sphere (x, y, z), dim 3).
+        """
+        super().__init__()
+        if temporal_encoding_type not in ("multifreq", "simple"):
+            raise ValueError(
+                f"temporal_encoding_type must be 'multifreq' or 'simple', "
+                f"got {temporal_encoding_type}"
+            )
+        if latlon_encoding_type not in ("multifreq", "simple"):
+            raise ValueError(
+                f"latlon_encoding_type must be 'multifreq' or 'simple', "
+                f"got {latlon_encoding_type}"
+            )
+        if channel_dim < 0 or temporal_dim < 0 or latlon_dim < 0:
+            raise ValueError("encoding dims must be non-negative")
+        if temporal_dim > 0:
+            if temporal_encoding_type == "simple" and temporal_dim != 3:
+                raise ValueError(
+                    f"simple temporal encoding requires temporal_dim=3, got {temporal_dim}"
+                )
+            if temporal_encoding_type == "multifreq" and temporal_dim % 2 != 0:
+                raise ValueError(f"temporal_dim must be even, got {temporal_dim}")
+        if latlon_dim > 0:
+            if latlon_encoding_type == "simple" and latlon_dim != 3:
+                raise ValueError(
+                    f"simple latlon encoding requires latlon_dim=3, got {latlon_dim}"
+                )
+            if latlon_encoding_type == "multifreq" and latlon_dim % 6 != 0:
+                raise ValueError(f"latlon_dim must be divisible by 6, got {latlon_dim}")
+        if not 0.0 <= latlon_dropout_rate <= 1.0:
+            raise ValueError(
+                f"latlon_dropout_rate must be in [0, 1], got {latlon_dropout_rate}"
+            )
+
+        self.embedding_size = embedding_size
+        self.channel_dim = channel_dim
+        self.temporal_dim = temporal_dim
+        self.latlon_dim = latlon_dim
+        self.temporal_encoding_type = temporal_encoding_type
+        self.latlon_encoding_type = latlon_encoding_type
+        # Configured rate; remains inactive (0.0) until ``enable_latlon_dropout`` is
+        # called (e.g. by the pretraining loop). Mirrors band_dropout so downstream
+        # users (fine-tuning / inference) get the encoding active with no dropout and
+        # never need to disable latlon_dropout_rate manually.
+        self._configured_latlon_dropout_rate = float(latlon_dropout_rate)
+        self.latlon_dropout_rate = 0.0
+        self.enc_dim = channel_dim + temporal_dim + latlon_dim
+
+        self.supported_modalities = supported_modalities
+        self.supported_modality_names = [m.name for m in supported_modalities]
+        self.tokenization_config = tokenization_config or TokenizationConfig()
+
+        # Per-modality, per-bandset learnable channel embeddings.
+        self.per_modality_channel_embeddings = nn.ParameterDict()
+        if channel_dim > 0:
+            for modality in supported_modalities:
+                num_bandsets = self.tokenization_config.get_num_bandsets(modality.name)
+                shape = (num_bandsets, channel_dim)
+                if random_channel_embeddings:
+                    init = torch.rand(shape)
+                else:
+                    init = torch.zeros(shape)
+                self.per_modality_channel_embeddings[modality.name] = nn.Parameter(
+                    init, requires_grad=learnable_channel_embeddings
+                )
+
+        # Combine projection: [img(embedding_size) + enc(enc_dim)] -> embedding_size.
+        # If enc_dim==0 this collapses to a Linear(embedding_size, embedding_size).
+        self.combine_proj = nn.Linear(embedding_size + self.enc_dim, embedding_size)
+
+    def enable_latlon_dropout(self) -> None:
+        """Activate latlon dropout at the configured rate.
+
+        Latlon dropout is inactive by default so that loaded models (fine-tuning /
+        inference) always use the full latlon encoding. The pretraining loop calls
+        this to enable per-sample latlon dropout during pretraining.
+        """
+        self.latlon_dropout_rate = self._configured_latlon_dropout_rate
+
+    def _ein_for_tokens(self, modality_tokens: Tensor) -> tuple[str, dict[str, int]]:
+        """Pick the einops shape string for the patch-projected token tensor."""
+        if modality_tokens.ndim == 3:
+            b, b_s, _ = modality_tokens.shape
+            return "b b_s d", {"b": b, "b_s": b_s}
+        if modality_tokens.ndim == 4:
+            b, t, b_s, _ = modality_tokens.shape
+            return "b t b_s d", {"b": b, "t": t, "b_s": b_s}
+        if modality_tokens.ndim == 5:
+            b, h, w, b_s, _ = modality_tokens.shape
+            return "b h w b_s d", {"b": b, "h": h, "w": w, "b_s": b_s}
+        if modality_tokens.ndim == 6:
+            b, h, w, t, b_s, _ = modality_tokens.shape
+            return (
+                "b h w t b_s d",
+                {"b": b, "h": h, "w": w, "t": t, "b_s": b_s},
+            )
+        raise ValueError(f"Unsupported tokens shape: {modality_tokens.shape}")
+
+    def _apply_per_modality(
+        self,
+        modality_name: str,
+        modality_tokens: Tensor,
+        timestamps: Tensor | None,
+        latlon: Tensor | None,
+    ) -> Tensor:
+        modality = Modality.get(modality_name)
+        ein_string, ein_dict = self._ein_for_tokens(modality_tokens)
+        device = modality_tokens.device
+        dtype = modality_tokens.dtype
+        b = modality_tokens.shape[0]
+        actual_bandsets = modality_tokens.shape[-2]
+
+        # Allocate encoding tensor with same leading shape as modality_tokens but
+        # last dim = enc_dim.
+        enc_shape = (*modality_tokens.shape[:-1], self.enc_dim)
+        enc = torch.zeros(enc_shape, device=device, dtype=dtype)
+
+        # --- Channel slot ---
+        if self.channel_dim > 0:
+            ch = self.per_modality_channel_embeddings[modality.name]
+            if ch.shape[0] != actual_bandsets:
+                raise ValueError(
+                    f"Channel embeddings for {modality.name} expect "
+                    f"{ch.shape[0]} bandsets but tokens have {actual_bandsets}."
+                )
+            ch_b = repeat(ch, f"b_s d -> {ein_string}", **ein_dict).to(
+                device=device, dtype=dtype
+            )
+            enc[..., : self.channel_dim] = ch_b
+
+        # --- Temporal slot ---
+        if (
+            self.temporal_dim > 0
+            and modality.is_multitemporal
+            and timestamps is not None
+        ):
+            if self.temporal_encoding_type == "simple":
+                ts_enc = get_simple_temporal_encoding(timestamps)  # (B, T, 3)
+            else:
+                ts_enc = get_static_temporal_encoding(
+                    timestamps, self.temporal_dim
+                )  # (B, T, D)
+            ts_b = repeat(ts_enc, f"b t d -> {ein_string}", **ein_dict).to(
+                device=device, dtype=dtype
+            )
+            enc[..., self.channel_dim : self.channel_dim + self.temporal_dim] = ts_b
+
+        # --- Latlon slot ---
+        # Apply only if rate < 1.0 AND latlon is provided. Dropout is per-sample
+        # bernoulli at train; eval applies full encoding (unless rate >= 1.0).
+        if (
+            self.latlon_dim > 0
+            and latlon is not None
+            and self.latlon_dropout_rate < 1.0
+        ):
+            latlon_f = latlon.to(device=device, dtype=torch.float32)
+            if self.latlon_encoding_type == "simple":
+                ll_enc = get_simple_latlon_encoding(latlon_f)  # (B, 3)
+            else:
+                ll_enc = get_static_latlon_encoding(
+                    latlon_f, self.latlon_dim
+                )  # (B, latlon_dim)
+            if self.training and self.latlon_dropout_rate > 0.0:
+                keep_prob = 1.0 - self.latlon_dropout_rate
+                keep = torch.bernoulli(torch.full((b,), keep_prob, device=device))
+                ll_enc = ll_enc * keep.unsqueeze(-1).to(dtype=ll_enc.dtype)
+            ll_b = repeat(ll_enc.to(dtype=dtype), f"b d -> {ein_string}", **ein_dict)
+            enc[..., self.channel_dim + self.temporal_dim :] = ll_b
+
+        # --- Combine: concat image and encoding tokens, then project. ---
+        combined = torch.cat([modality_tokens, enc], dim=-1)
+        return self.combine_proj(combined)
+
+    def forward(
+        self,
+        per_modality_input_tokens: dict[str, Tensor],
+        timestamps: Tensor,
+        patch_size: int,
+        input_res: int = BASE_GSD,
+        latlon: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Apply separate-path encodings to patchified tokens.
+
+        ``patch_size`` and ``input_res`` are accepted for interface parity with
+        :class:`CompositeEncodings` but are unused -- the separate-encoding flow
+        does not need them (spatial position is handled by RoPE at attention).
+        """
+        del patch_size, input_res  # unused in separate flow
+        output_dict: dict[str, Tensor] = {}
+        available = return_modalities_from_dict(per_modality_input_tokens)
+        modalities_to_process = get_modalities_to_process(
+            available, self.supported_modality_names
+        )
+        for modality_name in modalities_to_process:
+            output_dict[modality_name] = self._apply_per_modality(
+                modality_name,
+                per_modality_input_tokens[modality_name],
+                timestamps=timestamps,
+                latlon=latlon,
+            )
+        return output_dict
+
+
+class FlexiVitBase(nn.Module):
+    """FlexiVitBase is a base class for FlexiVit models."""
+
+    cross_attn: bool = False
+
+    def __init__(
+        self,
+        embedding_size: int,
+        max_sequence_length: int,
+        num_heads: int,
+        mlp_ratio: float,
+        depth: int,
+        drop_path: float,
+        supported_modalities: list[ModalitySpec],
+        learnable_channel_embeddings: bool = True,
+        random_channel_embeddings: bool = False,
+        use_flash_attn: bool = False,
+        qk_norm: bool = False,
+        tokenization_config: TokenizationConfig | None = None,
+        spatial_pos_encoding: str = "absolute",
+        rope_base: float = 10000.0,
+        rope_coordinate_scale: float = 1.0,
+        rope_mixed_base: float = 10.0,
+        encoding_mode: str = "additive",
+        channel_encoding_dim: int = 0,
+        temporal_encoding_dim: int = 0,
+        latlon_encoding_dim: int = 0,
+        latlon_dropout_rate: float = 0.0,
+        temporal_encoding_type: str = "multifreq",
+        latlon_encoding_type: str = "multifreq",
+    ) -> None:
+        """Initialize the FlexiVitBase class."""
+        super().__init__()
+        if spatial_pos_encoding not in SPATIAL_POS_ENCODING_TYPES:
+            raise ValueError(
+                f"spatial_pos_encoding must be one of {SPATIAL_POS_ENCODING_TYPES}, "
+                f"got {spatial_pos_encoding}"
+            )
+        if encoding_mode not in ENCODING_MODES:
+            raise ValueError(
+                f"encoding_mode must be one of {ENCODING_MODES}, got {encoding_mode}"
+            )
+        if rope_base <= 0:
+            raise ValueError(f"rope_base must be positive, got {rope_base}")
+        if rope_coordinate_scale <= 0:
+            raise ValueError(
+                f"rope_coordinate_scale must be positive, got {rope_coordinate_scale}"
+            )
+        if rope_mixed_base <= 0:
+            raise ValueError(f"rope_mixed_base must be positive, got {rope_mixed_base}")
+
+        self.embedding_size = embedding_size
+        self.supported_modalities = supported_modalities
+        self.supported_modality_names = [x.name for x in supported_modalities]
+        logger.info(f"modalities being used by model: {self.supported_modality_names}")
+
+        self.max_sequence_length = max_sequence_length
+        self._base_tokenization_config = tokenization_config or TokenizationConfig()
+
+        # Graceful SDPA fallback: if flash-attn was requested but isn't
+        # installed, drop to the (mask-based) SDPA path instead of hard-raising
+        # at attention time. This keeps core-deps / no-flash environments
+        # runnable on the exact same checkpoints.
+        if use_flash_attn:
+            from olmoearth2.model.attention import flash_attn as _flash_attn
+
+            if _flash_attn is None:
+                logger.warning(
+                    "use_flash_attn=True but flash-attn is not installed; "
+                    "falling back to the SDPA attention path."
+                )
+                use_flash_attn = False
+        self.use_flash_attn = use_flash_attn
+        self.spatial_pos_encoding = spatial_pos_encoding
+        self.rope_base = rope_base
+        self.rope_coordinate_scale = rope_coordinate_scale
+        self.rope_mixed_base = rope_mixed_base
+        self.learnable_channel_embeddings = learnable_channel_embeddings
+        self.random_channel_embeddings = random_channel_embeddings
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    embedding_size,
+                    num_heads,
+                    mlp_ratio,
+                    qkv_bias=True,
+                    qk_norm=qk_norm,
+                    norm_layer=nn.LayerNorm,  # TODO: This should be configurable
+                    cross_attn=self.cross_attn,
+                    drop_path=drop_path,
+                    use_flash_attn=self.use_flash_attn,
+                    use_2d_rope=self.spatial_pos_encoding == "rope",
+                    rope_base=self.rope_base,
+                    use_2d_rope_mixed=self.spatial_pos_encoding == "rope_mixed",
+                    rope_mixed_base=self.rope_mixed_base,
+                )
+                for _ in range(depth)
+            ]
+        )
+
+        self.encoding_mode = encoding_mode
+        if encoding_mode == "separate":
+            self.composite_encodings = SeparateEncodings(
+                embedding_size=embedding_size,
+                supported_modalities=self.supported_modalities,
+                tokenization_config=self._base_tokenization_config,
+                channel_dim=channel_encoding_dim,
+                temporal_dim=temporal_encoding_dim,
+                latlon_dim=latlon_encoding_dim,
+                latlon_dropout_rate=latlon_dropout_rate,
+                learnable_channel_embeddings=learnable_channel_embeddings,
+                random_channel_embeddings=random_channel_embeddings,
+                temporal_encoding_type=temporal_encoding_type,
+                latlon_encoding_type=latlon_encoding_type,
+            )
+        else:
+            self.composite_encodings = CompositeEncodings(
+                embedding_size,
+                self.supported_modalities,
+                max_sequence_length,
+                learnable_channel_embeddings,
+                random_channel_embeddings,
+                tokenization_config=self._base_tokenization_config,
+                spatial_pos_encoding=self.spatial_pos_encoding,
+            )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m: nn.Module) -> None:
+        if getattr(m, "_skip_custom_init", False):
+            logger.debug(f"Skipping custom init for {m}")
+            return
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    @staticmethod
+    def grab_modality_specific_dims(modality_data: Tensor) -> tuple[int, ...]:
+        """Grab the modality specific dimensions from the modality data.
+
+        Assumes [B, ..., C, D]
+
+        Every modality will have a batch dimension, a channel dimension and embedding dimension.
+
+        Args:
+            modality_data: Modality data
+
+        Returns:
+            Modality specific dimensions
+        """
+        return modality_data.shape[1:-2] if modality_data.ndim > 3 else ()
+
+    # is naming here confusing if one of these channels can be missing?
+    def collapse_and_combine_hwtc(self, x: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Collapse the tokens and masks, respectively, into two tensors."""
+        tokens, masks = [], []
+        available_modalities = return_modalities_from_dict(x)
+        modalities_to_process = get_modalities_to_process(
+            available_modalities, self.supported_modality_names
+        )
+        for modality in modalities_to_process:
+            masked_modality_name = MaskedOlmoEarthSample.get_masked_modality_name(
+                modality
+            )
+            x_modality = x[modality]
+            x_modality_mask = x[masked_modality_name]
+            tokens.append(rearrange(x_modality, "b ... d -> b (...) d"))
+            masks.append(rearrange(x_modality_mask, "b ... -> b (...)"))
+        tokens = torch.cat(tokens, dim=1)
+        masks = torch.cat(masks, dim=1)
+
+        return tokens, masks
+
+    def build_spatial_positions(
+        self,
+        tokens_only_dict: dict[str, Tensor],
+        original_masks_dict: dict[str, Tensor],
+        patch_size: int,
+        input_res: int,
+    ) -> Tensor | None:
+        """Build per-token spatial coordinates for 2D RoPE / RoPE-Mixed."""
+        if self.spatial_pos_encoding not in ("rope", "rope_mixed"):
+            return None
+
+        position_dict = {}
+        available_modalities = return_modalities_from_dict(tokens_only_dict)
+        modalities_to_process = get_modalities_to_process(
+            available_modalities, self.supported_modality_names
+        )
+        gsd_ratio = (
+            CompositeEncodings.calculate_gsd_ratio(input_res, patch_size)
+            * self.rope_coordinate_scale
+        )
+        for modality_name in modalities_to_process:
+            tokens = tokens_only_dict[modality_name]
+            modality = Modality.get(modality_name)
+            position_shape = (*tokens.shape[:-1], 2)
+            if not modality.is_spatial:
+                position_dict[modality_name] = torch.zeros(
+                    position_shape,
+                    dtype=torch.float32,
+                    device=tokens.device,
+                )
+                continue
+
+            if tokens.ndim not in (5, 6):
+                raise ValueError(
+                    f"Expected spatial tokens for {modality_name} to have 5 or 6 "
+                    f"dimensions, got {tokens.shape}"
+                )
+
+            b, h, w = tokens.shape[:3]
+            grid_row = torch.arange(h, device=tokens.device, dtype=torch.float32)
+            grid_col = torch.arange(w, device=tokens.device, dtype=torch.float32)
+            grid_row, grid_col = torch.meshgrid(grid_row, grid_col, indexing="ij")
+            grid = torch.stack([grid_row, grid_col], dim=-1) * gsd_ratio
+
+            if tokens.ndim == 5:
+                bandsets = tokens.shape[3]
+                positions = repeat(
+                    grid,
+                    "h w p -> b h w b_s p",
+                    b=b,
+                    b_s=bandsets,
+                )
+            else:
+                timesteps, bandsets = tokens.shape[3], tokens.shape[4]
+                positions = repeat(
+                    grid,
+                    "h w p -> b h w t b_s p",
+                    b=b,
+                    t=timesteps,
+                    b_s=bandsets,
+                )
+            position_dict[modality_name] = positions
+
+        position_dict.update(original_masks_dict)
+        positions, _ = self.collapse_and_combine_hwtc(position_dict)
+        return positions
+
+    @staticmethod
+    def split_x_y_positions(
+        positions: Tensor,
+        indices: Tensor,
+        max_length_of_decoded_tokens: Tensor,
+        max_length_of_unmasked_tokens: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Split positions using the same sorted order as predictor tokens."""
+        positions = positions.gather(1, indices[:, :, None].expand_as(positions))
+        positions_to_decode = positions[:, :max_length_of_decoded_tokens]
+        unmasked_positions = positions[:, -max_length_of_unmasked_tokens:]
+        return positions_to_decode, unmasked_positions
+
+    def add_register_positions(self, positions: Tensor) -> Tensor:
+        """Prepend zero coordinates for register tokens."""
+        batch_size = positions.shape[0]
+        register_positions = positions.new_zeros(
+            batch_size,
+            self.num_register_tokens,
+            positions.shape[-1],
+        )
+        return torch.cat([register_positions, positions], dim=1)
+
+    @staticmethod
+    def _construct_einops_pattern(
+        spatial_dims: tuple[int, ...],
+    ) -> tuple[str, dict[str, int]]:
+        """Given a tuple of spatial dimensions (e.g. [B, H, W, T, ...]).
+
+        build (1) an einops rearrange pattern of the form:
+            "d -> (dim0) (dim1) (dim2)... d"
+        and (2) a dictionary mapping dim0..dimN to the actual sizes.
+
+        This allows reshaping a single-dimensional tensor [D] into
+        [B, H, W, T, ..., D] using einops.
+        """
+        dim_dict = {f"dim{i}": size for i, size in enumerate(spatial_dims)}
+        # e.g., "d -> (dim0) (dim1) (dim2) (dim3) d"
+        pattern_input = (
+            "d -> " + " ".join(f"(dim{i})" for i in range(len(spatial_dims))) + " d"
+        )
+        return pattern_input, dim_dict
+
+    def split_tokens_masks_and_dims(
+        self, x: dict[str, Tensor]
+    ) -> tuple[dict[str, Tensor], dict[str, Tensor], dict[str, tuple]]:
+        """Split the tokens, masks, and dimensions out into separate dicts."""
+        tokens_only_dict = {}
+        original_masks_dict = {}
+        modalities_to_dims_dict = {}
+        available_modalities = return_modalities_from_dict(x)
+        modalities_to_process = get_modalities_to_process(
+            available_modalities, self.supported_modality_names
+        )
+        for modality in modalities_to_process:
+            x_modality = x[modality]
+            tokens_only_dict[modality] = x_modality
+            modalities_to_dims_dict[modality] = x_modality.shape
+            masked_modality_name = MaskedOlmoEarthSample.get_masked_modality_name(
+                modality
+            )
+            original_masks_dict[masked_modality_name] = x[masked_modality_name]
+        return tokens_only_dict, original_masks_dict, modalities_to_dims_dict
+
+    @staticmethod
+    def split_and_expand_per_modality(
+        x: Tensor, modalities_to_dims_dict: dict
+    ) -> dict[str, Tensor]:
+        """Split and expand the tokens per modality.
+
+        Args:
+            x: Tokens to split and expand (b n d)
+            modalities_to_dims_dict: Dictionary mapping modalities to their dimensions
+        Returns:
+            tokens_only_dict: mapping modalities to their tokens
+        """
+        tokens_only_dict = {}
+        tokens_reshaped = 0
+        for modality, dims in modalities_to_dims_dict.items():
+            # Skip batch (first) and embedding (last) dimensions
+            middle_dims = dims[1:-1]
+            num_tokens_for_modality = math.prod(middle_dims)
+
+            # Extract tokens for this modality (b n d)
+            modality_tokens = x[
+                :, tokens_reshaped : tokens_reshaped + num_tokens_for_modality
+            ]
+
+            # TODO: see if there  is a general and clean einops way to do this
+            # Reshape to original dimensions (e.g., for 4D spatial dims: b d1 d2 d3 d4 e)
+            x_modality = modality_tokens.view(x.shape[0], *middle_dims, x.shape[-1])
+
+            tokens_reshaped += num_tokens_for_modality
+            tokens_only_dict[modality] = x_modality
+
+        return tokens_only_dict
+
+    @staticmethod
+    def pack_tokens(tokens: Tensor, mask: Tensor) -> Tensor:
+        """Pack the Batch and sequence length dimensions of tokens and mask into a single tensor.
+
+        Args:
+            tokens: Tokens to pack
+            mask: Mask to pack
+
+        Returns:
+            Packed tokens enabling varlen flash attention
+        """
+        tokens_packed = torch.flatten(tokens, end_dim=1)
+        mask = torch.flatten(mask)
+        tokens = tokens_packed[mask]
+        return tokens
+
+    @staticmethod
+    def unpack_tokens(tokens: Tensor, mask: Tensor, og_shape: tuple) -> Tensor:
+        """Unpack the Batch and sequence length dimensions of tokens and mask into a single tensor.
+
+        Args:
+            tokens: Tokens to unpack
+            mask: Mask to unpack
+            og_shape: Original shape of the tokens
+        """
+        tokens_new = tokens.new_zeros(og_shape[0] * og_shape[1], og_shape[2])
+        mask = torch.flatten(mask)
+        tokens_new[mask] = tokens
+        tokens = tokens_new.reshape(og_shape[0], og_shape[1], -1)
+        return tokens
+
+    def apply_fsdp(self, **fsdp_kwargs: Any) -> None:
+        """Apply FSDP to the model."""
+        for block in self.blocks:
+            block.apply_fsdp(**fsdp_kwargs)
+
+    def apply_compile(self) -> None:
+        """Apply torch.compile to the model."""
+        for block in self.blocks:
+            block.apply_compile()
+
+
+class Encoder(FlexiVitBase):
+    """Encoder module that processes masked input samples into token representations."""
+
+    cross_attn: bool = False
+
+    def __init__(
+        self,
+        embedding_size: int,
+        max_patch_size: int,
+        min_patch_size: int,
+        num_heads: int,
+        mlp_ratio: float,
+        depth: int,
+        drop_path: float,
+        supported_modalities: list[ModalitySpec],
+        max_sequence_length: int,
+        num_register_tokens: int = 0,
+        learnable_channel_embeddings: bool = True,
+        random_channel_embeddings: bool = False,
+        num_projection_layers: int = 1,
+        aggregate_then_project: bool = True,
+        use_flash_attn: bool = False,
+        frozen_patch_embeddings: bool = False,
+        qk_norm: bool = False,
+        log_token_norm_stats: bool = False,
+        output_embedding_size: int | None = None,
+        tokenization_config: TokenizationConfig | None = None,
+        use_linear_patch_embed: bool = True,
+        band_dropout_rate: float = 0.0,
+        random_band_dropout: bool = False,
+        band_dropout_modalities: list[str] | None = None,
+        patch_embed_hidden_sizes: list[int] | None = None,
+        post_proj_hidden_sizes: list[int] | None = None,
+        spatial_pos_encoding: str = "absolute",
+        rope_base: float = 10000.0,
+        rope_coordinate_scale: float = 1.0,
+        rope_mixed_base: float = 10.0,
+        encoding_mode: str = "additive",
+        channel_encoding_dim: int = 0,
+        temporal_encoding_dim: int = 0,
+        latlon_encoding_dim: int = 0,
+        latlon_dropout_rate: float = 0.0,
+        temporal_encoding_type: str = "multifreq",
+        latlon_encoding_type: str = "multifreq",
+    ):
+        """Initialize the encoder.
+
+        Args:
+            embedding_size: Size of token embeddings
+            max_patch_size: Maximum patch size for patchification
+            min_patch_size: Minimum patch size for patchification
+            num_heads: Number of attention heads
+            mlp_ratio: Ratio for MLP hidden dimension
+            depth: Number of transformer layers
+            drop_path: Drop path rate
+            supported_modalities: list documenting modalities used in a given model instantiation
+            max_sequence_length: Maximum sequence length
+            num_register_tokens: Number of register tokens to use
+            learnable_channel_embeddings: Whether to use learnable channel embeddings
+            random_channel_embeddings: Initialize channel embeddings randomly (zeros if False)
+            num_projection_layers: The number of layers to use in the projection. If >1, then
+                a ReLU activation will be applied between layers
+            aggregate_then_project: If True, then we will average the tokens before applying
+                the projection. If False, we will apply the projection first.
+            use_flash_attn: Whether to use flash attention
+            frozen_patch_embeddings: If True, we freeze the embedding layer, as recommended in
+                https://arxiv.org/pdf/2104.02057, Section 4.2
+            qk_norm: Whether to apply normalization to Q and K in attention
+            log_token_norm_stats: Whether to log the token norm stats
+            output_embedding_size: If set, project tokens to this size after attention
+            tokenization_config: Optional config for custom band groupings
+            use_linear_patch_embed: If True, use nn.Linear for patch projection (faster).
+                Set False to load checkpoints trained before this flag existed (Conv2d weights).
+            band_dropout_rate: Probability of dropping each band channel during training.
+            random_band_dropout: If True, sample dropout rate from Uniform(0, band_dropout_rate).
+            band_dropout_modalities: If provided, only apply band dropout to these
+                modalities. If None, apply to all modalities. Default: None.
+            patch_embed_hidden_sizes: Optional list of hidden layer widths for a
+                per-pixel MLP applied BEFORE patchification in the spatial patch
+                projection. If None or empty, the projection is a single nn.Linear
+                over the flattened patch (current behavior). Otherwise, each pixel's
+                ``in_chans`` channel vector is mapped via
+                Linear(in_chans, h[0]) -> ReLU -> ... -> Linear(h[-2], h[-1]) -> ReLU
+                (weights shared across all pixels), and the resulting H x W x h[-1]
+                feature map is patchified and projected to embedding_size.
+            post_proj_hidden_sizes: Optional list of hidden layer widths for an MLP
+                applied AFTER the patch projection. Each entry adds a
+                ReLU -> Linear(prev, h) layer, applied before the norm.
+            spatial_pos_encoding: Spatial encoding type: "absolute", "rope",
+                "rope_mixed", or "none".
+            rope_base: Frequency base for axial RoPE.
+            rope_coordinate_scale: Multiplier applied to runtime GSD-scaled RoPE coordinates.
+            rope_mixed_base: Frequency base used to initialize learnable
+                RoPE-Mixed frequencies.
+            encoding_mode: "additive" (default; legacy CompositeEncodings) or
+                "separate" (concat image-projection token with a
+                channel+temporal+latlon encoding token, then linear-project to
+                ``embedding_size``).
+            channel_encoding_dim: Width of the channel embedding slot under
+                ``encoding_mode='separate'``. Must be ``0`` otherwise.
+            temporal_encoding_dim: Width of the static_temporal slot. Must be
+                even and ``0`` unless ``encoding_mode='separate'``.
+            latlon_encoding_dim: Width of the static_latlon slot. Must be
+                divisible by 6 and ``0`` unless ``encoding_mode='separate'``.
+            latlon_dropout_rate: Per-sample bernoulli dropout for the latlon
+                slot at training time. ``rate >= 1.0`` disables the slot
+                entirely (train+eval). Default ``0``.
+            temporal_encoding_type: ``'multifreq'`` or ``'simple'`` (3-number
+                [frac_year, sin, cos]) under ``encoding_mode='separate'``.
+            latlon_encoding_type: ``'multifreq'`` or ``'simple'`` (3-number
+                unit-sphere [x, y, z]) under ``encoding_mode='separate'``.
+        """
+        self.tokenization_config = tokenization_config or TokenizationConfig()
+        super().__init__(
+            embedding_size=embedding_size,
+            depth=depth,
+            mlp_ratio=mlp_ratio,
+            num_heads=num_heads,
+            max_sequence_length=max_sequence_length,
+            learnable_channel_embeddings=learnable_channel_embeddings,
+            drop_path=drop_path,
+            supported_modalities=supported_modalities,
+            use_flash_attn=use_flash_attn,
+            random_channel_embeddings=random_channel_embeddings,
+            qk_norm=qk_norm,
+            tokenization_config=self.tokenization_config,
+            spatial_pos_encoding=spatial_pos_encoding,
+            rope_base=rope_base,
+            rope_coordinate_scale=rope_coordinate_scale,
+            rope_mixed_base=rope_mixed_base,
+            encoding_mode=encoding_mode,
+            channel_encoding_dim=channel_encoding_dim,
+            temporal_encoding_dim=temporal_encoding_dim,
+            latlon_encoding_dim=latlon_encoding_dim,
+            latlon_dropout_rate=latlon_dropout_rate,
+            temporal_encoding_type=temporal_encoding_type,
+            latlon_encoding_type=latlon_encoding_type,
+        )
+        self.num_register_tokens = num_register_tokens
+        self.has_register_tokens = num_register_tokens > 0
+        self.log_token_norm_stats = log_token_norm_stats
+        if self.has_register_tokens:
+            self.register_tokens = nn.Parameter(
+                torch.zeros(num_register_tokens, embedding_size)
+            )
+        self.min_patch_size = min_patch_size
+        self.max_patch_size = max_patch_size
+        self.embedding_size = embedding_size
+        self.use_linear_patch_embed = use_linear_patch_embed
+        # Configured rate; remains inactive until ``enable_band_dropout`` is called.
+        # Default is disabled so fine-tuning never applies band dropout unless the
+        # caller (e.g. pretraining online encoder) explicitly enables it.
+        self.band_dropout_rate = band_dropout_rate
+        self.random_band_dropout = random_band_dropout
+        self.band_dropout_modalities = band_dropout_modalities
+        self.patch_embed_hidden_sizes = patch_embed_hidden_sizes
+        self.post_proj_hidden_sizes = post_proj_hidden_sizes
+        self.patch_embeddings = MultiModalPatchEmbeddings(
+            self.supported_modality_names,
+            self.max_patch_size,
+            self.embedding_size,
+            tokenization_config=self.tokenization_config,
+            use_linear_patch_embed=self.use_linear_patch_embed,
+            band_dropout_rate=0.0,
+            random_band_dropout=self.random_band_dropout,
+            band_dropout_modalities=self.band_dropout_modalities,
+            patch_embed_hidden_sizes=self.patch_embed_hidden_sizes,
+            post_proj_hidden_sizes=self.post_proj_hidden_sizes,
+        )
+        self.output_embedding_size = output_embedding_size
+        # If output_embedding_size is set, project tokens to that size after attention
+        self.embedding_projector: ProjectAndAggregate | None = None
+        if output_embedding_size is not None:
+            self.embedding_projector = ProjectAndAggregate(
+                embedding_size=self.embedding_size,
+                num_layers=1,
+                output_embedding_size=output_embedding_size,
+                only_project=True,
+            )
+            final_embedding_size = output_embedding_size
+        else:
+            final_embedding_size = self.embedding_size
+        self.project_and_aggregate = ProjectAndAggregate(
+            embedding_size=final_embedding_size,
+            num_layers=num_projection_layers,
+            aggregate_then_project=aggregate_then_project,
+        )
+        self.norm = nn.LayerNorm(self.embedding_size)
+
+        self.apply(self._init_weights)
+
+        if frozen_patch_embeddings:
+            for p in self.patch_embeddings.parameters():
+                p.requires_grad = False
+        if self.has_register_tokens:
+            self._init_register_tokens()
+
+    def enable_band_dropout(self) -> None:
+        """Enable band dropout using the configured rate.
+
+        Band dropout is disabled by default so it never activates during
+        fine-tuning. Call this only on the online encoder during pretraining.
+        """
+        self.patch_embeddings.band_dropout_rate = self.band_dropout_rate
+
+    def _init_register_tokens(self) -> None:
+        """Initialize the register tokens."""
+        nn.init.xavier_uniform_(self.register_tokens)
+
+    def create_token_exit_ids(
+        self, x: dict[str, Tensor], token_exit_cfg: dict[str, int]
+    ) -> dict[str, Tensor]:
+        """Create the token exit ids for # of layers of attention for each band group.
+
+        Assumes modality channel groups are in the second to last dimension of the tokens.
+        """
+        exit_ids_per_modality_dict = {}
+        available_modalities = return_modalities_from_dict(x)
+        modalities_to_process = get_modalities_to_process(
+            available_modalities, self.supported_modality_names
+        )
+        for modality in modalities_to_process:
+            num_exit_layers = token_exit_cfg[modality]
+            exit_seq_modality = torch.full_like(x[modality], fill_value=num_exit_layers)
+            exit_ids_per_modality_dict[modality] = exit_seq_modality
+        return exit_ids_per_modality_dict
+
+    @staticmethod
+    def remove_masked_tokens(
+        x: Tensor, mask: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Remove masked tokens from the tokens and masks.
+
+        Implementation from https://stackoverflow.com/a/68621610/2332296
+
+        On Input:
+        0 means this token should be removed
+        1 means this token should be kept
+
+        Args:
+            x: Tokens to remove masked tokens from
+            mask: Mask to remove masked tokens from
+
+        Returns:
+            tokens: [B, T, D]
+            indices: [B, T]
+            updated_mask: [B, T]
+            seqlens: [B]
+            max_length: [1]
+            where T is the max number of unmasked tokens for an instance
+        """
+        sorted_mask, indices = torch.sort(mask, dim=1, descending=True, stable=True)
+        # Now all the places where we want to keep the token are at the front of the tensor
+        x = x.gather(1, indices[:, :, None].expand_as(x))
+        # Now all tokens that should be kept are first in the tensor
+
+        # set masked values to 0 (not really necessary since we'll ignore them anyway)
+        x = x * sorted_mask.unsqueeze(-1)
+
+        # cut off to the length of the longest sequence
+        seq_lengths = sorted_mask.sum(-1)
+        max_length = seq_lengths.max()
+        x = x[:, :max_length]
+        # New mask chopped to the longest sequence
+        updated_mask = sorted_mask[:, :max_length]
+
+        return x, indices, updated_mask, seq_lengths, max_length
+
+    @staticmethod
+    def add_removed_tokens(
+        x: Tensor, indices: Tensor, mask: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Add removed tokens to the tokens and masks.
+
+        Args:
+            x: Tokens to add removed tokens to
+            indices: Original indices of the masked tokens
+            mask: Mask to add removed tokens to
+
+        Returns:
+            tokens: Tokens with removed tokens added
+            mask: Mask with removed tokens added
+        """
+        assert x.shape[1] > 0, (
+            "x must have at least one token we should not mask all tokens"
+        )
+        masked_tokens = repeat(
+            torch.zeros_like(x[0, 0, :]), "d -> b t d", b=x.shape[0], t=indices.shape[1]
+        )
+        full_mask = torch.cat(
+            (
+                mask,
+                torch.zeros(
+                    (x.shape[0], indices.shape[1] - x.shape[1]),
+                    device=x.device,
+                    dtype=mask.dtype,
+                ),
+            ),
+            dim=-1,
+        )
+        # can't set value on leaf variable
+        out = masked_tokens.clone()
+        # put tokens in full masked tensor (at the first N positions in every row)
+        out[full_mask] = x[mask]
+        # then move them to their original positions
+        out = out.scatter(1, indices[:, :, None].expand_as(out), out)
+        full_mask = full_mask.scatter(1, indices.expand_as(full_mask), full_mask)
+        # Values that were masked out are not returned but the values that are still there are returned to the original positions
+        return out, full_mask
+
+    def create_exit_seqs(
+        self,
+        tokens_only_dict: dict[str, Tensor],
+        mask_only_dict: dict[str, Tensor],
+        token_exit_cfg: dict[str, int] | None,
+    ) -> tuple[Tensor | None]:
+        """Create the exit sequences and tokens."""
+        # Check that tokens_only_dict doesn't contain any mask keys
+        assert all(not key.endswith("_mask") for key in tokens_only_dict), (
+            "tokens_only_dict should not contain mask keys"
+        )
+        if token_exit_cfg:
+            exit_ids_per_modality = self.create_token_exit_ids(
+                tokens_only_dict, token_exit_cfg
+            )
+            exit_ids_per_modality.update(mask_only_dict)
+            # Exit ids seqs tells us which layer to exit each token
+            exit_ids_seq, _ = self.collapse_and_combine_hwtc(exit_ids_per_modality)
+        else:
+            exit_ids_seq = None
+        return exit_ids_seq
+
+    def _maybe_get_attn_mask(
+        self,
+        new_mask: Tensor,
+        fast_pass: bool,
+    ) -> Tensor | None:
+        """Get the attention mask or None if we should pass None to the transformer."""
+        if fast_pass or not self.training:
+            return None
+        else:
+            return new_mask
+
+    def add_register_tokens_and_masks(
+        self,
+        tokens: Tensor,
+        attn_mask: Tensor | None,
+        processed_register_tokens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Concatenate register tokens to the tokens."""
+        batch_size = tokens.shape[0]
+        # Expand register tokens to match batch size: [num_register_tokens, embedding_size] -> [batch_size, num_register_tokens, embedding_size]
+        if processed_register_tokens is None:
+            reg_tokens = self.register_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            reg_tokens = processed_register_tokens
+        # Concatenate register tokens at the beginning: [batch_size, seq_len, embedding_size] -> [batch_size, num_register_tokens + seq_len, embedding_size]
+        tokens = torch.cat([reg_tokens, tokens], dim=1)
+        if attn_mask is not None:
+            # Create mask for register tokens (all True - they should participate in attention)
+            reg_mask = torch.ones(
+                batch_size,
+                self.num_register_tokens,
+                dtype=attn_mask.dtype,
+                device=attn_mask.device,
+            )
+            attn_mask = torch.cat([reg_mask, attn_mask], dim=1)
+        else:
+            reg_mask = None
+        return tokens, attn_mask
+
+    def pop_register_tokens(self, tokens: Tensor) -> tuple[Tensor, Tensor]:
+        """Pop the register tokens from the tokens."""
+        register_tokens = tokens[:, : self.num_register_tokens, :]
+        tokens = tokens[:, self.num_register_tokens :, :]
+        return tokens, register_tokens
+
+    def get_token_norm_stats(
+        self, tokens: Tensor, register_tokens: Tensor
+    ) -> dict[str, float]:
+        """Get the token norm stats."""
+        # Compute norms for register tokens: [batch_size, num_register_tokens]
+        register_tokens_norms = torch.norm(register_tokens, dim=2)
+        reg_norms_flat = register_tokens_norms.flatten()
+        reg_stats = {
+            "register_mean": reg_norms_flat.mean().item(),
+            "register_min": reg_norms_flat.min().item(),
+            "register_max": reg_norms_flat.max().item(),
+        }
+
+        # Compute norms for non-register tokens: [batch_size, seq_len]
+        nonreg_tokens_norms = torch.norm(tokens, dim=2)
+        nonreg_norms_flat = nonreg_tokens_norms.flatten()
+        percentiles = [25.0, 75.0, 90.0, 95.0, 99.0]
+        nonreg_percentiles = torch.quantile(
+            nonreg_norms_flat.float(),
+            torch.tensor(
+                [p / 100.0 for p in percentiles], device=nonreg_norms_flat.device
+            ),
+        ).tolist()
+        nonreg_stats = {
+            "nonregister_mean": nonreg_norms_flat.mean().item(),
+            "nonregister_min": nonreg_norms_flat.min().item(),
+            "nonregister_max": nonreg_norms_flat.max().item(),
+            "nonregister_std": nonreg_norms_flat.std().item(),
+            "nonregister_25th": nonreg_percentiles[0],
+            "nonregister_75th": nonreg_percentiles[1],
+            "nonregister_90th": nonreg_percentiles[2],
+            "nonregister_95th": nonreg_percentiles[3],
+            "nonregister_99th": nonreg_percentiles[4],
+        }
+
+        token_norm_stats = {**reg_stats, **nonreg_stats}
+        return token_norm_stats
+
+    def _maybe_remove_masked_tokens(
+        self,
+        tokens: Tensor,
+        mask: Tensor,
+        fast_pass: bool,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Remove masked tokens from the tokens and masks."""
+        if fast_pass and not self.use_flash_attn:
+            # This is the inference fast pass
+            indices = None
+            new_mask = None
+            seq_lengths = None
+            max_seqlen = None
+            bool_mask = None
+        else:
+            bool_mask = mask == MaskValue.ONLINE_ENCODER.value
+            tokens, indices, new_mask, seq_lengths, max_seqlen = (
+                self.remove_masked_tokens(tokens, bool_mask)
+            )
+        return tokens, indices, new_mask, seq_lengths, max_seqlen, bool_mask
+
+    def _maybe_add_removed_tokens(
+        self,
+        tokens: Tensor,
+        indices: Tensor,
+        mask: Tensor,
+        fast_pass: bool,
+    ) -> Tensor:
+        """Add removed tokens to the tokens and masks."""
+        if not fast_pass:
+            tokens, _ = self.add_removed_tokens(tokens, indices, mask)
+        return tokens
+
+    def apply_attn(
+        self,
+        x: dict[str, Tensor],
+        timestamps: Tensor,
+        patch_size: int,
+        input_res: int,
+        token_exit_cfg: dict[str, int] | None = None,
+        fast_pass: bool = False,
+        latlon: Tensor | None = None,
+    ) -> tuple[dict[str, Tensor], dict[str, Any] | None]:
+        """Apply the attention to the tokens and masks."""
+        tokens_only_dict, original_masks_dict, modalities_to_dims_dict = (
+            self.split_tokens_masks_and_dims(x)
+        )
+        # already a no-op but we could remove entirely
+        exit_ids_seq = self.create_exit_seqs(
+            tokens_only_dict, original_masks_dict, token_exit_cfg
+        )
+        # exited tokens are just the linear projection
+        exited_tokens, _ = self.collapse_and_combine_hwtc(x)
+
+        tokens_dict = self.composite_encodings.forward(
+            tokens_only_dict,
+            timestamps,
+            patch_size,
+            input_res,
+            latlon=latlon,
+        )
+        positions = self.build_spatial_positions(
+            tokens_only_dict,
+            original_masks_dict,
+            patch_size,
+            input_res,
+        )
+        tokens_dict.update(original_masks_dict)
+
+        tokens, mask = self.collapse_and_combine_hwtc(tokens_dict)
+
+        tokens, indices, new_mask, seq_lengths, max_seqlen, bool_mask = (
+            self._maybe_remove_masked_tokens(tokens, mask, fast_pass)
+        )
+        if positions is not None and bool_mask is not None:
+            positions, _, _, _, _ = self.remove_masked_tokens(positions, bool_mask)
+
+        if exit_ids_seq is not None:
+            exit_ids_seq, _, _, _, _ = self.remove_masked_tokens(
+                exit_ids_seq, bool_mask
+            )
+            # still linear projections
+            exited_tokens, _, _, _, _ = self.remove_masked_tokens(
+                exited_tokens, bool_mask
+            )
+
+        # Pack x tokens
+        if self.use_flash_attn:
+            cu_seqlens = get_cumulative_sequence_lengths(seq_lengths)
+            og_shape = tokens.shape
+            tokens = self.pack_tokens(tokens, new_mask)
+            if positions is not None:
+                positions = self.pack_tokens(positions, new_mask)
+        else:
+            cu_seqlens = None
+
+        attn_mask = self._maybe_get_attn_mask(
+            new_mask,
+            fast_pass=fast_pass,
+        )
+
+        if self.has_register_tokens:
+            tokens, attn_mask = self.add_register_tokens_and_masks(tokens, attn_mask)
+            if positions is not None:
+                positions = self.add_register_positions(positions)
+
+        # Apply attn with varying encoder depths
+        for i_blk, blk in enumerate(self.blocks):
+            # Skip the zeroth block because we want to use the exited tokens that don't have encodings as this allows trivial solution of predicting the shared encodings
+            if (exit_ids_seq is not None) and (i_blk > 0):
+                # this should only ever be called by the target encoder,
+                # in a torch.no_grad context
+                assert exited_tokens is not None
+                # If a token should exit, then we update the exit token with the current token at the same position
+                exited_tokens = torch.where(
+                    condition=(exit_ids_seq == i_blk),
+                    input=tokens,
+                    other=exited_tokens,
+                )
+            # we take the inverse of the mask because a value
+            # of True indicates the value *should* take part in
+            # attention
+            # WARNING: THIS MAY CHANGE DEPENDING ON THE ATTENTION IMPLEMENTATION
+
+            tokens = blk(
+                x=tokens,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                # we will have to specify k and q lens for cross attention
+                attn_mask=attn_mask,
+                rope_positions=positions,
+            )
+
+        if self.has_register_tokens:
+            tokens, register_tokens = self.pop_register_tokens(tokens)
+            token_norm_stats = (
+                self.get_token_norm_stats(tokens, register_tokens)
+                if self.log_token_norm_stats
+                else None
+            )
+        else:
+            token_norm_stats = None
+
+        if self.use_flash_attn:
+            tokens = self.unpack_tokens(tokens, new_mask, og_shape)
+
+        if exit_ids_seq is not None:
+            # this should only ever be called by the target encoder,
+            # in a torch.no_grad context
+            assert exited_tokens is not None
+            # full depth
+            # IMPORTANT: write this to x
+            tokens = torch.where(
+                condition=(exit_ids_seq == (i_blk + 1)),  # 2 for full depth
+                input=tokens,
+                other=exited_tokens,
+            )
+        # we apply the norm before we add the removed tokens,
+        # so that the norm is only computed against "real" tokens
+        tokens = self.norm(tokens)
+        # we don't care about the mask returned by add_removed_tokens, since we will
+        # just use the original, unclipped mask here
+        tokens = self._maybe_add_removed_tokens(tokens, indices, new_mask, fast_pass)
+
+        tokens_per_modality_dict = self.split_and_expand_per_modality(
+            tokens, modalities_to_dims_dict
+        )
+        # merge original masks and the processed tokens
+        tokens_per_modality_dict.update(original_masks_dict)
+        return tokens_per_modality_dict, token_norm_stats
+
+    def forward(
+        self,
+        x: MaskedOlmoEarthSample,
+        patch_size: int,
+        input_res: int = BASE_GSD,
+        token_exit_cfg: dict | None = None,
+        fast_pass: bool = False,
+    ) -> dict[str, Any]:
+        """Process masked input samples into token representations.
+
+        Args:
+            x: Masked input sample containing the data to be encoded
+            patch_size: Size of patches to divide the input into
+            input_res: Resolution of the input data
+            token_exit_cfg: Configuration for token exit
+            fast_pass: Whether to always pass None as the mask to the transformer, this enables torch based flash attention, and skips mask construciton and sorting
+
+        Returns:
+            TokensAndMasks containing the encoded representations and their masks
+        """
+        if fast_pass and token_exit_cfg is not None:
+            raise ValueError("token_exit_cfg cannot be set when fast_pass is True")
+
+        patchified_tokens_and_masks = self.patch_embeddings.forward(x, patch_size)
+
+        if token_exit_cfg is None or any(
+            [exit_depth > 0 for exit_depth in token_exit_cfg.values()]
+        ):
+            patchified_tokens_and_masks, token_norm_stats = self.apply_attn(
+                x=patchified_tokens_and_masks,
+                timestamps=x.timestamps,
+                patch_size=patch_size,
+                input_res=input_res,
+                token_exit_cfg=token_exit_cfg,
+                fast_pass=fast_pass,
+                latlon=getattr(x, "latlon", None),
+            )
+        else:
+            token_norm_stats = {}
+        output = TokensAndMasks(**patchified_tokens_and_masks)
+
+        # Project to output_embedding_size if configured
+        if self.embedding_projector is not None:
+            output = self.embedding_projector(output)
+
+        output_dict: dict[str, Any] = {
+            "tokens_and_masks": output,
+        }
+        if token_norm_stats:
+            output_dict["token_norm_stats"] = token_norm_stats
+
+        if not fast_pass:
+            output_dict["project_aggregated"] = self.project_and_aggregate(output)
+
+        return output_dict
+
+    def apply_fsdp(self, **fsdp_kwargs: Any) -> None:
+        """Apply FSDP to the model."""
+        super().apply_fsdp(**fsdp_kwargs)
+        # Don't Shard the small layers
+        # fully_shard(self.patch_embeddings, **fsdp_kwargs)
+        # register_fsdp_forward_method(self.patch_embeddings, "forward")
+        # fully_shard(self.project_and_aggregate, **fsdp_kwargs)
+        # register_fsdp_forward_method(self.project_and_aggregate, "forward")
+        fully_shard(self, **fsdp_kwargs)
+
+    def apply_compile(self) -> None:
+        """Apply torch.compile to the model."""
+        # self.compile(mode="max-autotune", dynamic=False, fullgraph=True)
+        logger.info("Compiling blocks")
+        # torch.compile(self.blocks, dynamic=False, mode="max-autotune", fullgraph=True)
+        # individual block compile is still a lot slower
+        for block in self.blocks:
+            block.apply_compile()
+        # torch.compile(self.patch_embeddings, dynamic=False, mode="max-autotune-no-cudagraphs", fullgraph=True)
+
+
+class PredictorBase(FlexiVitBase):
+    """Predictor module that generates predictions from encoded tokens."""
+
+    cross_attn = True
+
+    def __init__(
+        self,
+        supported_modalities: list[ModalitySpec],
+        encoder_embedding_size: int = 128,
+        decoder_embedding_size: int = 128,
+        depth: int = 2,
+        mlp_ratio: float = 2.0,
+        num_heads: int = 8,
+        max_sequence_length: int = 24,
+        drop_path: float = 0.0,
+        learnable_channel_embeddings: bool = True,
+        random_channel_embeddings: bool = False,
+        output_embedding_size: int | None = None,
+        use_flash_attn: bool = False,
+        qk_norm: bool = False,
+        tokenization_config: TokenizationConfig | None = None,
+        spatial_pos_encoding: str = "absolute",
+        rope_base: float = 10000.0,
+        rope_coordinate_scale: float = 1.0,
+        rope_mixed_base: float = 10.0,
+        encoding_mode: str = "additive",
+        channel_encoding_dim: int = 0,
+        temporal_encoding_dim: int = 0,
+        latlon_encoding_dim: int = 0,
+        latlon_dropout_rate: float = 0.0,
+        temporal_encoding_type: str = "multifreq",
+        latlon_encoding_type: str = "multifreq",
+    ):
+        """Initialize the predictor.
+
+        Args:
+            supported_modalities: modalities this model instantiation supports
+            encoder_embedding_size: Size of encoder embeddings
+            decoder_embedding_size: Size of decoder embeddings
+            depth: Number of transformer layers
+            mlp_ratio: Ratio for MLP hidden dimension
+            num_heads: Number of attention heads
+            max_sequence_length: Maximum sequence length
+            drop_path: Drop path rate
+            learnable_channel_embeddings: Whether to use learnable channel embeddings
+            random_channel_embeddings: Whether to randomly initialize channel embeddings
+            output_embedding_size: Size of output embeddings
+            use_flash_attn: Whether to use flash attention
+            qk_norm: Whether to apply normalization to Q and K in attention
+            tokenization_config: Optional config for custom band groupings
+            spatial_pos_encoding: Spatial encoding type: "absolute", "rope",
+                "rope_mixed", or "none".
+            rope_base: Frequency base for axial RoPE.
+            rope_coordinate_scale: Multiplier applied to runtime GSD-scaled RoPE coordinates.
+            rope_mixed_base: Frequency base used to initialize learnable
+                RoPE-Mixed frequencies.
+            encoding_mode: "additive" (default) or "separate" (concat
+                image+encoding then linear-project; see Encoder).
+            channel_encoding_dim: Channel-embedding slot width under
+                ``encoding_mode='separate'``.
+            temporal_encoding_dim: static_temporal slot width.
+            latlon_encoding_dim: static_latlon slot width (divisible by 6).
+            latlon_dropout_rate: Per-sample bernoulli dropout for the latlon
+                slot at training time. ``rate >= 1.0`` disables entirely.
+            temporal_encoding_type: ``'multifreq'`` or ``'simple'``.
+            latlon_encoding_type: ``'multifreq'`` or ``'simple'``.
+        """
+        self.tokenization_config = tokenization_config or TokenizationConfig()
+        super().__init__(
+            embedding_size=decoder_embedding_size,
+            depth=depth,
+            mlp_ratio=mlp_ratio,
+            num_heads=num_heads,
+            max_sequence_length=max_sequence_length,
+            drop_path=drop_path,
+            learnable_channel_embeddings=learnable_channel_embeddings,
+            random_channel_embeddings=random_channel_embeddings,
+            supported_modalities=supported_modalities,
+            use_flash_attn=use_flash_attn,
+            qk_norm=qk_norm,
+            tokenization_config=self.tokenization_config,
+            spatial_pos_encoding=spatial_pos_encoding,
+            rope_base=rope_base,
+            rope_coordinate_scale=rope_coordinate_scale,
+            rope_mixed_base=rope_mixed_base,
+            encoding_mode=encoding_mode,
+            channel_encoding_dim=channel_encoding_dim,
+            temporal_encoding_dim=temporal_encoding_dim,
+            latlon_encoding_dim=latlon_encoding_dim,
+            latlon_dropout_rate=latlon_dropout_rate,
+            temporal_encoding_type=temporal_encoding_type,
+            latlon_encoding_type=latlon_encoding_type,
+        )
+        self.learnable_channel_embeddings = learnable_channel_embeddings
+        self.random_channel_embeddings = random_channel_embeddings
+        self.encoder_embedding_size = encoder_embedding_size
+        self.encoder_to_decoder_embed = nn.Linear(
+            encoder_embedding_size, decoder_embedding_size, bias=True
+        )
+        if output_embedding_size is None:
+            output_embedding_size = encoder_embedding_size
+        self.output_embedding_size = output_embedding_size
+        self.to_output_embed = nn.Linear(
+            decoder_embedding_size, output_embedding_size, bias=True
+        )
+        # THIS is the learnable mask token
+        self.mask_token = nn.Parameter(torch.zeros(decoder_embedding_size))
+
+        self.input_norm = nn.LayerNorm(encoder_embedding_size)
+        self.norm = nn.LayerNorm(decoder_embedding_size)
+
+        self.apply(self._init_weights)
+
+    def add_masks(self, x: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Replace tokens that should be decoded (MaskValue.DECODER_ONLY) with the learnable mask token.
+
+        in a dimension-agnostic way using einops. We assume the final dimension of each token tensor
+        is the embedding dimension matching self.mask_token's size.
+        """
+        output_dict = {}
+        available_modalities = return_modalities_from_dict(x)
+        modalities_to_process = get_modalities_to_process(
+            available_modalities, self.supported_modality_names
+        )
+        for modality in modalities_to_process:
+            x_modality = x[modality]
+            mask_name = MaskedOlmoEarthSample.get_masked_modality_name(modality)
+            mask_modality = x[mask_name]
+            # A boolean mask: True where tokens must be replaced by the mask token
+            kept_mask = mask_modality == MaskValue.DECODER.value
+
+            # Build the einops pattern and dimension dict
+            spatial_dims = x_modality.shape[
+                :-1
+            ]  # all dimensions except the last (embedding)
+            pattern_input, dim_dict = self._construct_einops_pattern(spatial_dims)
+
+            mask_token_broadcasted = repeat(self.mask_token, pattern_input, **dim_dict)
+
+            # Where kept_mask is True, use the broadcasted mask token
+            x_modality = torch.where(
+                kept_mask.unsqueeze(-1).bool(), mask_token_broadcasted, x_modality
+            )
+
+            output_dict[modality] = x_modality
+
+        return output_dict
+
+    # TODO: GIVE more explicit function names
+    @staticmethod
+    def split_x_y(tokens: Tensor, mask: Tensor) -> tuple[Tensor, ...]:
+        """Splits tokens into three groups based on mask values.
+
+        This function:
+        1. Sorts tokens according to the mask and gathers them in order.
+        2. Chooses tokens to be decoded (x) based on the mask value DECODER.
+        3. Chooses tokens to be used as context (y) based on the mask value ONLINE_ENCODER.
+        4. Identifies missing tokens (z) based on the mask value MISSING.
+        5. Returns boolean masks for x, y, and z along with indices to revert to the original ordering.
+
+        Args:
+            tokens: Tokens to split of shape [B, T, D].
+            mask: Mask of shape [B, T].
+
+        Returns:
+            tokens_to_decode: Tokens to be decoded of shape [B, X_len, D].
+            unmasked_tokens: Tokens to be used as context of shape [B, Y_len, D].
+            tokens_to_decode_mask: Binary mask for x tokens of shape [B, X_len].
+            unmasked_tokens_mask: Binary mask for y tokens of shape [B, Y_len].
+            indices: Indices for restoring the original token ordering of shape [B, T].
+            seqlens_tokens_to_decode: Sequence lengths of tokens to decode of shape [B].
+            seqlens_unmasked_tokens: Sequence lengths of unmasked tokens of shape [B].
+            max_length_of_decoded_tokens: Maximum length of decoded tokens of shape [1].
+            max_length_of_unmasked_tokens: Maximum length of unmasked tokens of shape [1].
+        """
+        # Set Missing Masks to Target Encoder ONLY so that we can have all unused tokens in the middle
+        org_mask_dtype = mask.dtype
+        missing_mask = mask == MaskValue.MISSING.value
+        mask[missing_mask] = MaskValue.TARGET_ENCODER_ONLY.value
+
+        # Sort tokens by mask value (descending order)
+        sorted_mask, indices = torch.sort(
+            mask.int(), dim=1, descending=True, stable=True
+        )
+        tokens = tokens.gather(1, indices[:, :, None].expand_as(tokens))
+
+        # Create binary masks for Encoder and Decoder
+        binarized_decoder_mask = sorted_mask == MaskValue.DECODER.value
+        binarized_online_encoder_mask = sorted_mask == MaskValue.ONLINE_ENCODER.value
+
+        seqlens_unmasked_tokens = binarized_online_encoder_mask.sum(dim=-1)
+        max_length_of_unmasked_tokens = seqlens_unmasked_tokens.max()
+        seqlens_tokens_to_decode = binarized_decoder_mask.sum(dim=-1)
+        max_length_of_decoded_tokens = seqlens_tokens_to_decode.max()
+
+        # the y mask is going to be used to determine which of the y values take. True values
+        # take part in the attention (we don't take the inverse here, unlike in the decoder)
+        tokens_to_decode = tokens[:, :max_length_of_decoded_tokens]
+        tokens_to_decode_mask = binarized_decoder_mask[
+            :, :max_length_of_decoded_tokens
+        ].to(org_mask_dtype)
+
+        unmasked_tokens = tokens[:, -max_length_of_unmasked_tokens:]
+        # the x_mask is just going to be used in the reconstruction, to know which
+        # x tokens to add back into the token list. TODO is this even necessary? it could
+        # get padded with noise tokens since we don't care about reconstruction at all
+        # for a whole bunch of tokens
+        unmasked_tokens_mask = binarized_online_encoder_mask[
+            :, -max_length_of_unmasked_tokens:
+        ].to(org_mask_dtype)
+
+        return (
+            tokens_to_decode,
+            unmasked_tokens,
+            tokens_to_decode_mask,
+            unmasked_tokens_mask,
+            indices,
+            seqlens_tokens_to_decode,
+            seqlens_unmasked_tokens,
+            max_length_of_decoded_tokens,
+            max_length_of_unmasked_tokens,
+        )
+
+    @staticmethod
+    def combine_x_y(
+        tokens_to_decode: Tensor,
+        unmasked_tokens: Tensor,
+        tokens_to_decode_mask: Tensor,
+        unmasked_tokens_mask: Tensor,
+        indices: Tensor,
+    ) -> Tensor:
+        """Reintegrate the separated token sequences into their original order.
+
+        The token masks zero out positions which are not used/needed,
+        and the final scatter step re-applies the original ordering tracked in 'indices'.
+
+        Args:
+            tokens_to_decode: Key/value tokens of shape [B, X_len, D].
+            unmasked_tokens: Query tokens of shape [B, Y_len, D].
+            tokens_to_decode_mask: Binary mask for tokens to decode of shape [B, X_len].
+            unmasked_tokens_mask: Binary mask for unmasked tokens of shape [B, Y_len].
+            indices: Indices for restoring the original token ordering of shape [B, T].
+
+        Returns:
+            A merged tokens tensor of shape [B, T, D] with all tokens in their
+            original positions.
+        """
+        # Get dimensions
+        B, T = indices.shape[0], indices.shape[1]
+        D = tokens_to_decode.shape[-1]
+        tokens = torch.zeros(
+            (B, T, D), dtype=tokens_to_decode.dtype, device=tokens_to_decode.device
+        )
+        tokens[:, -unmasked_tokens.shape[1] :] = (
+            unmasked_tokens * unmasked_tokens_mask.unsqueeze(-1)
+        )
+        tokens[:, : tokens_to_decode.shape[1]] += (
+            tokens_to_decode * tokens_to_decode_mask.unsqueeze(-1)
+        )
+        tokens = tokens.scatter(1, indices[:, :, None].expand_as(tokens), tokens)
+        return tokens
+
+    def is_any_data_to_be_decoded(self, modality_mask: Tensor) -> bool:
+        """Check if any data is to be decoded for a given modality."""
+        return (MaskValue.DECODER.value == modality_mask).any()
+
+    def apply_fsdp(self, **fsdp_kwargs: Any) -> None:
+        """Apply FSDP to the model."""
+        super().apply_fsdp(**fsdp_kwargs)
+        fully_shard(self, **fsdp_kwargs)
+
+
+class Predictor(PredictorBase):
+    """Predictor module that generates predictions from encoded tokens."""
+
+    cross_attn = True
+
+    def apply_attn(
+        self,
+        x: dict[str, Tensor],
+        timestamps: Tensor,
+        patch_size: int,
+        input_res: int,
+        latlon: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Apply attention to the tokens."""
+        tokens_only_dict, original_masks_dict, modalities_to_dims_dict = (
+            self.split_tokens_masks_and_dims(x)
+        )
+        tokens_dict = self.composite_encodings(
+            tokens_only_dict, timestamps, patch_size, input_res, latlon=latlon
+        )
+        positions = self.build_spatial_positions(
+            tokens_only_dict,
+            original_masks_dict,
+            patch_size,
+            input_res,
+        )
+        tokens_dict.update(original_masks_dict)
+        all_tokens, mask = self.collapse_and_combine_hwtc(tokens_dict)
+        # X contains the tokens to decode, Y contains the tokens to attend to for context
+        (
+            tokens_to_decode,
+            unmasked_tokens,
+            tokens_to_decode_mask,
+            unmasked_tokens_mask,
+            indices,
+            seqlens_tokens_to_decode,
+            seqlens_unmasked_tokens,
+            max_length_of_tokens_to_decode,
+            max_length_of_unmasked_tokens,
+        ) = self.split_x_y(all_tokens, mask)
+        if positions is not None:
+            positions_to_decode, unmasked_positions = self.split_x_y_positions(
+                positions,
+                indices,
+                max_length_of_tokens_to_decode,
+                max_length_of_unmasked_tokens,
+            )
+        else:
+            positions_to_decode = None
+            unmasked_positions = None
+        # Pack x tokens
+        if self.use_flash_attn:
+            og_shape_tokens_to_decode = tokens_to_decode.shape
+            tokens_to_decode = self.pack_tokens(
+                tokens_to_decode, tokens_to_decode_mask.bool()
+            )
+            if positions_to_decode is not None:
+                positions_to_decode = self.pack_tokens(
+                    positions_to_decode, tokens_to_decode_mask.bool()
+                )
+            og_shape_unmasked_tokens = unmasked_tokens.shape
+            unmasked_tokens = self.pack_tokens(
+                unmasked_tokens, unmasked_tokens_mask.bool()
+            )
+            if unmasked_positions is not None:
+                unmasked_positions = self.pack_tokens(
+                    unmasked_positions, unmasked_tokens_mask.bool()
+                )
+            cu_seqlens_tokens_to_decode = get_cumulative_sequence_lengths(
+                seqlens_tokens_to_decode
+            )
+            cu_seqlens_unmasked_tokens = get_cumulative_sequence_lengths(
+                seqlens_unmasked_tokens
+            )
+        else:
+            cu_seqlens_tokens_to_decode = None
+            cu_seqlens_unmasked_tokens = None
+
+        for blk in self.blocks:
+            # note that we are not taking the inverse of the mask, since split_x_y gives us
+            # true values for values we want to take part in attention
+            tokens_to_decode = blk(
+                x=tokens_to_decode,
+                y=unmasked_tokens,
+                attn_mask=(
+                    unmasked_tokens_mask.bool() if not self.use_flash_attn else None
+                ),  # only for flash attn though this should not be left in
+                cu_seqlens_q=cu_seqlens_tokens_to_decode,
+                cu_seqlens_k=cu_seqlens_unmasked_tokens,
+                max_seqlen_q=max_length_of_tokens_to_decode,
+                max_seqlen_k=max_length_of_unmasked_tokens,
+                rope_positions=positions_to_decode,
+                rope_positions_y=unmasked_positions,
+            )
+
+        if self.use_flash_attn:
+            tokens_to_decode = self.unpack_tokens(
+                tokens_to_decode,
+                tokens_to_decode_mask.bool(),
+                og_shape_tokens_to_decode,
+            )
+            unmasked_tokens = self.unpack_tokens(
+                unmasked_tokens, unmasked_tokens_mask.bool(), og_shape_unmasked_tokens
+            )
+
+        x = self.combine_x_y(
+            tokens_to_decode=tokens_to_decode,
+            unmasked_tokens=unmasked_tokens,
+            tokens_to_decode_mask=tokens_to_decode_mask,
+            unmasked_tokens_mask=unmasked_tokens_mask,
+            indices=indices,
+        )
+        tokens_per_modality_dict = self.split_and_expand_per_modality(
+            x, modalities_to_dims_dict
+        )
+        tokens_per_modality_dict.update(original_masks_dict)
+        return tokens_per_modality_dict
+
+    def forward(
+        self,
+        x: TokensAndMasks,
+        timestamps: Tensor,
+        patch_size: int,
+        input_res: int = BASE_GSD,
+        latlon: Tensor | None = None,
+    ) -> TokensAndMasks:
+        """Generate predictions from encoded token representations.
+
+        Args:
+            x: TokensAndMasks containing the encoded tokens to make predictions from
+            timestamps: Timestamps of the tokens
+            patch_size: Patch size of the tokens
+            input_res: Input resolution of the tokens
+            latlon: Optional per-sample tile-center lat/lon. Ignored unless
+                ``encoding_mode='separate'`` with ``latlon_encoding_dim>0``.
+
+        Returns:
+            TokensAndMasks containing the predicted tokens and their masks
+        """
+        decoder_emedded_dict = x.as_dict()
+        # Apply Input Norms and encoder to decoder embeds to each modality
+        available_modalities = x.modalities
+        modalities_to_process = get_modalities_to_process(
+            available_modalities, self.supported_modality_names
+        )
+        for modality in modalities_to_process:
+            x_modality = getattr(x, modality)
+            # Although, we do not account for missing tokens both proj and normalize are on token dimension so there is no mixing with real tokens
+            x_modality = self.input_norm(x_modality)
+            x_modality = self.encoder_to_decoder_embed(x_modality)
+            masked_modality_name = x.get_masked_modality_name(modality)
+            decoder_emedded_dict[modality] = x_modality
+            decoder_emedded_dict[masked_modality_name] = getattr(
+                x, masked_modality_name
+            )
+
+        tokens_only_dict = self.add_masks(decoder_emedded_dict)
+        decoder_emedded_dict.update(tokens_only_dict)
+        tokens_and_masks = self.apply_attn(
+            decoder_emedded_dict, timestamps, patch_size, input_res, latlon=latlon
+        )
+        # TODO: Factor this out into a more readable function
+        output_dict = {}
+        available_modalities = return_modalities_from_dict(tokens_and_masks)
+        modalities_to_process = get_modalities_to_process(
+            available_modalities, self.supported_modality_names
+        )
+        for modality in modalities_to_process:
+            masked_modality_name = MaskedOlmoEarthSample.get_masked_modality_name(
+                modality
+            )
+            modality_mask = tokens_and_masks[masked_modality_name]
+            # patchify masked data
+            per_modality_output_tokens = []
+            modality_data = tokens_and_masks[modality]
+
+            num_band_sets = self.tokenization_config.get_num_bandsets(modality)
+            for idx in range(num_band_sets):
+                per_channel_modality_data = modality_data[..., idx, :]
+                output_data = self.to_output_embed(self.norm(per_channel_modality_data))
+                per_modality_output_tokens.append(output_data)
+            output_dict[modality] = torch.stack(per_modality_output_tokens, dim=-2)
+            output_dict[masked_modality_name] = modality_mask
+        return TokensAndMasks(**output_dict)
+
+
+@dataclass
+class EncoderConfig(Config):
+    """Configuration for the Encoder."""
+
+    supported_modality_names: list[str]
+
+    embedding_size: int = 16
+    # This is the base patch size for the patch embedder
+    max_patch_size: int = 8
+    min_patch_size: int = 1
+    num_heads: int = 2
+    mlp_ratio: float = 1.0
+    depth: int = 2
+    drop_path: float = 0.1
+    max_sequence_length: int = 12
+    num_register_tokens: int = 0
+    learnable_channel_embeddings: bool = True
+    random_channel_embeddings: bool = False
+    num_projection_layers: int = 1
+    aggregate_then_project: bool = True
+    use_flash_attn: bool = False
+    frozen_patch_embeddings: bool = False
+    qk_norm: bool = False
+    log_token_norm_stats: bool = False
+    output_embedding_size: int | None = None
+    tokenization_config: TokenizationConfig | None = None
+    use_linear_patch_embed: bool = True
+    band_dropout_rate: float = 0.0
+    random_band_dropout: bool = False
+    band_dropout_modalities: list[str] | None = None
+    patch_embed_hidden_sizes: list[int] | None = None
+    post_proj_hidden_sizes: list[int] | None = None
+    spatial_pos_encoding: str = "absolute"
+    rope_base: float = 10000.0
+    rope_coordinate_scale: float = 1.0
+    rope_mixed_base: float = 10.0
+    encoding_mode: str = "additive"
+    channel_encoding_dim: int = 0
+    temporal_encoding_dim: int = 0
+    latlon_encoding_dim: int = 0
+    latlon_dropout_rate: float = 0.0
+    temporal_encoding_type: str = "multifreq"
+    latlon_encoding_type: str = "multifreq"
+
+    def __post_init__(self) -> None:
+        """Coerce raw dicts to TokenizationConfig for old checkpoint compatibility."""
+        if isinstance(self.tokenization_config, dict):
+            self.tokenization_config = TokenizationConfig(**self.tokenization_config)
+
+    def validate(self) -> None:
+        """Validate the configuration."""
+        if len(self.supported_modalities) == 0:
+            raise ValueError("At least one modality must be added!")
+        else:
+            for modality in self.supported_modalities:
+                if modality not in Modality.values():
+                    raise ValueError(f"Modality {modality} is not supported")
+        if self.band_dropout_modalities is not None:
+            unknown = set(self.band_dropout_modalities) - set(
+                self.supported_modality_names
+            )
+            if unknown:
+                raise ValueError(
+                    f"band_dropout_modalities contains modalities not in "
+                    f"supported_modality_names: {unknown}"
+                )
+        if self.tokenization_config is not None:
+            self.tokenization_config.validate()
+        if self.spatial_pos_encoding not in SPATIAL_POS_ENCODING_TYPES:
+            raise ValueError(
+                f"spatial_pos_encoding must be one of {SPATIAL_POS_ENCODING_TYPES}, "
+                f"got {self.spatial_pos_encoding}"
+            )
+        if self.rope_base <= 0:
+            raise ValueError(f"rope_base must be positive, got {self.rope_base}")
+        if self.rope_coordinate_scale <= 0:
+            raise ValueError(
+                f"rope_coordinate_scale must be positive, got {self.rope_coordinate_scale}"
+            )
+        if self.rope_mixed_base <= 0:
+            raise ValueError(
+                f"rope_mixed_base must be positive, got {self.rope_mixed_base}"
+            )
+        if self.spatial_pos_encoding in ("rope", "rope_mixed"):
+            head_dim = self.embedding_size // self.num_heads
+            if head_dim % 4 != 0:
+                raise ValueError(
+                    f"2D RoPE / RoPE-Mixed require head_dim divisible by 4, "
+                    f"got {head_dim}"
+                )
+        _validate_separate_encoding_fields(
+            self.encoding_mode,
+            self.channel_encoding_dim,
+            self.temporal_encoding_dim,
+            self.latlon_encoding_dim,
+            self.latlon_dropout_rate,
+            self.temporal_encoding_type,
+            self.latlon_encoding_type,
+        )
+
+    @property
+    def supported_modalities(self) -> list[ModalitySpec]:
+        """Get the supported modalities."""
+        return get_modality_specs_from_names(self.supported_modality_names)
+
+    def build(self) -> "Encoder":
+        """Build the encoder."""
+        self.validate()
+        kwargs = self.as_dict(exclude_none=True, recurse=False)
+        # supported_modality_names is replaced by supported_modalities
+        kwargs.pop("supported_modality_names")
+        kwargs["supported_modalities"] = self.supported_modalities
+        logger.info(f"Encoder kwargs: {kwargs}")
+        return Encoder(**kwargs)
+
+
+@dataclass
+class PredictorConfig(Config):
+    """Configuration for the Predictor."""
+
+    supported_modality_names: list[str]
+    encoder_embedding_size: int = 16
+    decoder_embedding_size: int = 16
+    depth: int = 2
+    mlp_ratio: float = 1.0
+    num_heads: int = 2
+    max_sequence_length: int = 12
+    drop_path: float = 0.0
+    learnable_channel_embeddings: bool = True
+    random_channel_embeddings: bool = False
+    output_embedding_size: int | None = None
+    use_flash_attn: bool = False
+    qk_norm: bool = False
+    tokenization_config: TokenizationConfig | None = None
+    spatial_pos_encoding: str = "absolute"
+    rope_base: float = 10000.0
+    rope_coordinate_scale: float = 1.0
+    rope_mixed_base: float = 10.0
+    encoding_mode: str = "additive"
+    channel_encoding_dim: int = 0
+    temporal_encoding_dim: int = 0
+    latlon_encoding_dim: int = 0
+    latlon_dropout_rate: float = 0.0
+    temporal_encoding_type: str = "multifreq"
+    latlon_encoding_type: str = "multifreq"
+
+    def __post_init__(self) -> None:
+        """Coerce raw dicts to TokenizationConfig for old checkpoint compatibility."""
+        if isinstance(self.tokenization_config, dict):
+            self.tokenization_config = TokenizationConfig(**self.tokenization_config)
+
+    def validate(self) -> None:
+        """Validate the configuration."""
+        if len(self.supported_modalities) == 0:
+            raise ValueError("At least one modality must be added!")
+        else:
+            for modality in self.supported_modalities:
+                if modality not in Modality.values():
+                    raise ValueError(f"Modality {modality} is not supported")
+        if self.tokenization_config is not None:
+            self.tokenization_config.validate()
+        if self.spatial_pos_encoding not in SPATIAL_POS_ENCODING_TYPES:
+            raise ValueError(
+                f"spatial_pos_encoding must be one of {SPATIAL_POS_ENCODING_TYPES}, "
+                f"got {self.spatial_pos_encoding}"
+            )
+        if self.rope_base <= 0:
+            raise ValueError(f"rope_base must be positive, got {self.rope_base}")
+        if self.rope_coordinate_scale <= 0:
+            raise ValueError(
+                f"rope_coordinate_scale must be positive, got {self.rope_coordinate_scale}"
+            )
+        if self.rope_mixed_base <= 0:
+            raise ValueError(
+                f"rope_mixed_base must be positive, got {self.rope_mixed_base}"
+            )
+        if self.spatial_pos_encoding in ("rope", "rope_mixed"):
+            head_dim = self.decoder_embedding_size // self.num_heads
+            if head_dim % 4 != 0:
+                raise ValueError(
+                    f"2D RoPE / RoPE-Mixed require head_dim divisible by 4, "
+                    f"got {head_dim}"
+                )
+        _validate_separate_encoding_fields(
+            self.encoding_mode,
+            self.channel_encoding_dim,
+            self.temporal_encoding_dim,
+            self.latlon_encoding_dim,
+            self.latlon_dropout_rate,
+            self.temporal_encoding_type,
+            self.latlon_encoding_type,
+        )
+
+    @property
+    def supported_modalities(self) -> list[ModalitySpec]:
+        """Get the supported modalities."""
+        return get_modality_specs_from_names(self.supported_modality_names)
+
+    def build(self) -> "PredictorBase":
+        """Build the predictor."""
+        self.validate()
+        kwargs = self.as_dict(exclude_none=True, recurse=False)
+        # supported_modality_names is replaced by supported_modalities
+        kwargs.pop("supported_modality_names")
+        kwargs["supported_modalities"] = self.supported_modalities
+        logger.info(f"Predictor kwargs: {kwargs}")
+        return Predictor(**kwargs)
