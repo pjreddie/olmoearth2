@@ -268,8 +268,62 @@ def build_dataset_config(common: CommonComponents) -> OlmoEarthDatasetConfig:
     )
 
 
-def make_build_trainer_config(*, wandb_project: str, wandb_enabled: bool):
-    """Build the trainer-config builder (no downstream eval; that's Phase 4)."""
+def build_eval_tasks(eval_interval_steps: int = 4000) -> dict:
+    """Build the in-loop downstream-eval task set (Phase 4).
+
+    Imported lazily by the trainer builder so the ``[training]``-only install
+    does not need the eval stack (geobench / sklearn / rioxarray).
+    """
+    from olmoearth2.eval.datasets.normalize import NormMethod
+    from olmoearth2.eval.metrics import EvalMetric
+    from olmoearth2.model.flexi_vit import PoolingType
+    from olmoearth2.train.callbacks.evaluator_callback import (
+        DownstreamTaskConfig,
+        EvalMode,
+    )
+
+    return {
+        "m-eurosat": DownstreamTaskConfig(
+            dataset="m-eurosat",
+            embedding_batch_size=128,
+            num_workers=0,
+            pooling_type=PoolingType.MEAN,
+            norm_stats_from_pretrained=True,
+            norm_method=NormMethod.NORM_NO_CLIP_2_STD,
+            input_modalities=[Modality.SENTINEL2_L2A.name],
+            eval_mode=EvalMode.KNN,
+            primary_metric=EvalMetric.ACCURACY,
+            eval_interval=Duration.steps(eval_interval_steps),
+        ),
+        "mados": DownstreamTaskConfig(
+            dataset="mados",
+            embedding_batch_size=128,
+            probe_batch_size=128,
+            num_workers=8,
+            pooling_type=PoolingType.MEAN,
+            norm_stats_from_pretrained=False,
+            norm_method=NormMethod.NORM_NO_CLIP_2_STD,
+            probe_lr=0.01,
+            eval_interval=Duration.steps(eval_interval_steps),
+            input_modalities=[Modality.SENTINEL2_L2A.name],
+            eval_mode=EvalMode.LINEAR_PROBE,
+            primary_metric=EvalMetric.MICRO_F1,
+        ),
+    }
+
+
+def make_build_trainer_config(
+    *,
+    wandb_project: str,
+    wandb_enabled: bool,
+    downstream_eval: bool = False,
+    eval_interval_steps: int = 4000,
+):
+    """Build the trainer-config builder.
+
+    Set ``downstream_eval=True`` to attach the in-loop ``DownstreamEvaluator``
+    (Phase 4); requires the ``[eval]`` extra.
+    """
 
     def build_trainer_config(common: CommonComponents) -> TrainerConfig:
         MAX_DURATION = Duration.epochs(300)
@@ -280,7 +334,7 @@ def make_build_trainer_config(*, wandb_project: str, wandb_enabled: bool):
             entity="eai-ai2",
             enabled=wandb_enabled,
         )
-        return (
+        trainer = (
             TrainerConfig(
                 work_dir=common.save_folder,
                 load_strategy=LoadStrategy.if_available,
@@ -304,6 +358,17 @@ def make_build_trainer_config(*, wandb_project: str, wandb_enabled: bool):
                 ),
             )
         )
+        if downstream_eval:
+            # Lazy import keeps the eval stack optional.
+            from olmoearth2.train.callbacks import DownstreamEvaluatorCallbackConfig
+
+            trainer = trainer.with_callback(
+                "downstream_evaluator",
+                DownstreamEvaluatorCallbackConfig(
+                    tasks=build_eval_tasks(eval_interval_steps)
+                ),
+            )
+        return trainer
 
     return build_trainer_config
 
