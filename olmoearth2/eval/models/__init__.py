@@ -1,34 +1,44 @@
-"""Models for evals."""
+"""Baseline eval models, behind per-model optional extras.
+
+Each baseline pulls heavy, model-specific deps (terratorch, timm, claymodel,
+satlaspretrain, ...). Imports are therefore **lazy** (PEP 562): importing this
+package costs nothing, and a given baseline's deps are only required when that
+baseline's symbol is actually accessed. This implements the PLAN's
+"opt-in per-model extras" for the 11 baseline adapters.
+"""
 
 from enum import StrEnum
 from typing import Any
 
-from olmoearth2.eval.models.anysat.anysat import AnySat, AnySatConfig
-from olmoearth2.eval.models.clay.clay import Clay, ClayConfig
-from olmoearth2.eval.models.croma.croma import CROMA_SIZES, Croma, CromaConfig
-from olmoearth2.eval.models.dinov3.constants import DinoV3Models
-from olmoearth2.eval.models.dinov3.dinov3 import DINOv3, DINOv3Config
-from olmoearth2.eval.models.galileo import GalileoConfig, GalileoWrapper
-from olmoearth2.eval.models.galileo.single_file_galileo import (
-    MODEL_SIZE_TO_WEKA_PATH as GALILEO_MODEL_SIZE_TO_WEKA_PATH,
-)
-from olmoearth2.eval.models.panopticon.panopticon import (
-    Panopticon,
-    PanopticonConfig,
-)
-from olmoearth2.eval.models.presto.presto import PrestoConfig, PrestoWrapper
-from olmoearth2.eval.models.prithviv2.prithviv2 import (
-    PrithviV2,
-    PrithviV2Config,
-    PrithviV2Models,
-)
-from olmoearth2.eval.models.satlas.satlas import Satlas, SatlasConfig
-from olmoearth2.eval.models.terramind.terramind import (
-    TERRAMIND_SIZES,
-    Terramind,
-    TerramindConfig,
-)
-from olmoearth2.eval.models.tessera.tessera import Tessera, TesseraConfig
+# symbol name -> (submodule, attribute) for lazy resolution
+_LAZY: dict[str, tuple[str, str]] = {
+    "AnySat": ("anysat.anysat", "AnySat"),
+    "AnySatConfig": ("anysat.anysat", "AnySatConfig"),
+    "Clay": ("clay.clay", "Clay"),
+    "ClayConfig": ("clay.clay", "ClayConfig"),
+    "Croma": ("croma.croma", "Croma"),
+    "CromaConfig": ("croma.croma", "CromaConfig"),
+    "CROMA_SIZES": ("croma.croma", "CROMA_SIZES"),
+    "DinoV3Models": ("dinov3.constants", "DinoV3Models"),
+    "DINOv3": ("dinov3.dinov3", "DINOv3"),
+    "DINOv3Config": ("dinov3.dinov3", "DINOv3Config"),
+    "GalileoConfig": ("galileo", "GalileoConfig"),
+    "GalileoWrapper": ("galileo", "GalileoWrapper"),
+    "Panopticon": ("panopticon.panopticon", "Panopticon"),
+    "PanopticonConfig": ("panopticon.panopticon", "PanopticonConfig"),
+    "PrestoConfig": ("presto.presto", "PrestoConfig"),
+    "PrestoWrapper": ("presto.presto", "PrestoWrapper"),
+    "PrithviV2": ("prithviv2.prithviv2", "PrithviV2"),
+    "PrithviV2Config": ("prithviv2.prithviv2", "PrithviV2Config"),
+    "PrithviV2Models": ("prithviv2.prithviv2", "PrithviV2Models"),
+    "Satlas": ("satlas.satlas", "Satlas"),
+    "SatlasConfig": ("satlas.satlas", "SatlasConfig"),
+    "Terramind": ("terramind.terramind", "Terramind"),
+    "TerramindConfig": ("terramind.terramind", "TerramindConfig"),
+    "TERRAMIND_SIZES": ("terramind.terramind", "TERRAMIND_SIZES"),
+    "Tessera": ("tessera.tessera", "Tessera"),
+    "TesseraConfig": ("tessera.tessera", "TesseraConfig"),
+}
 
 
 class BaselineModelName(StrEnum):
@@ -47,65 +57,50 @@ class BaselineModelName(StrEnum):
     CLAY = "clay"
 
 
-MODELS_WITH_MULTIPLE_SIZES: dict[BaselineModelName, Any] = {
-    BaselineModelName.CROMA: CROMA_SIZES,
-    BaselineModelName.DINO_V3: list(DinoV3Models),
-    BaselineModelName.GALILEO: GALILEO_MODEL_SIZE_TO_WEKA_PATH.keys(),
-    BaselineModelName.PRITHVI_V2: list(PrithviV2Models),
-    BaselineModelName.TERRAMIND: TERRAMIND_SIZES,
+def __getattr__(name: str) -> Any:
+    """Lazily import a baseline symbol (keeps each model's deps optional)."""
+    import importlib
+
+    if name in _LAZY:
+        submod, attr = _LAZY[name]
+        module = importlib.import_module(f"olmoearth2.eval.models.{submod}")
+        return getattr(module, attr)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def models_with_multiple_sizes() -> dict[BaselineModelName, Any]:
+    """Return the size options per multi-size baseline (resolved lazily)."""
+    from olmoearth2.eval.models.galileo.single_file_galileo import (
+        MODEL_SIZE_TO_WEKA_PATH,
+    )
+
+    return {
+        BaselineModelName.CROMA: __getattr__("CROMA_SIZES"),
+        BaselineModelName.DINO_V3: list(__getattr__("DinoV3Models")),
+        BaselineModelName.GALILEO: list(MODEL_SIZE_TO_WEKA_PATH.keys()),
+        BaselineModelName.PRITHVI_V2: list(__getattr__("PrithviV2Models")),
+        BaselineModelName.TERRAMIND: __getattr__("TERRAMIND_SIZES"),
+    }
+
+
+_LAUNCH_SCRIPTS: dict[BaselineModelName, str] = {
+    BaselineModelName.DINO_V3: "dinov3/dino_v3_launch.py",
+    BaselineModelName.GALILEO: "galileo/galileo_launch.py",
+    BaselineModelName.PANOPTICON: "panopticon/panopticon_launch.py",
+    BaselineModelName.TERRAMIND: "terramind/terramind_launch.py",
+    BaselineModelName.SATLAS: "satlas/satlas_launch.py",
+    BaselineModelName.CROMA: "croma/croma_launch.py",
+    BaselineModelName.CLAY: "clay/clay_launch.py",
+    BaselineModelName.PRESTO: "presto/presto_launch.py",
+    BaselineModelName.ANYSAT: "anysat/anysat_launch.py",
+    BaselineModelName.TESSERA: "tessera/tessera_launch.py",
+    BaselineModelName.PRITHVI_V2: "prithviv2/prithviv2_launch.py",
 }
 
 
 def get_launch_script_path(model_name: str) -> str:
-    """Get the launch script path for a model."""
-    if model_name == BaselineModelName.DINO_V3:
-        return "olmoearth2/evals/models/dinov3/dino_v3_launch.py"
-    elif model_name == BaselineModelName.GALILEO:
-        return "olmoearth2/evals/models/galileo/galileo_launch.py"
-    elif model_name == BaselineModelName.PANOPTICON:
-        return "olmoearth2/evals/models/panopticon/panopticon_launch.py"
-    elif model_name == BaselineModelName.TERRAMIND:
-        return "olmoearth2/evals/models/terramind/terramind_launch.py"
-    elif model_name == BaselineModelName.SATLAS:
-        return "olmoearth2/evals/models/satlas/satlas_launch.py"
-    elif model_name == BaselineModelName.CROMA:
-        return "olmoearth2/evals/models/croma/croma_launch.py"
-    elif model_name == BaselineModelName.CLAY:
-        return "olmoearth2/evals/models/clay/clay_launch.py"
-    elif model_name == BaselineModelName.PRESTO:
-        return "olmoearth2/evals/models/presto/presto_launch.py"
-    elif model_name == BaselineModelName.ANYSAT:
-        return "olmoearth2/evals/models/anysat/anysat_launch.py"
-    elif model_name == BaselineModelName.TESSERA:
-        return "olmoearth2/evals/models/tessera/tessera_launch.py"
-    elif model_name == BaselineModelName.PRITHVI_V2:
-        return "olmoearth2/evals/models/prithviv2/prithviv2_launch.py"
-    else:
-        raise ValueError(f"Invalid model name: {model_name}")
+    """Get the launch script path for a baseline model."""
+    return f"olmoearth2/eval/models/{_LAUNCH_SCRIPTS[BaselineModelName(model_name)]}"
 
 
-# TODO: assert that they all store a patch_size variable and supported modalities
-__all__ = [
-    "Panopticon",
-    "PanopticonConfig",
-    "GalileoWrapper",
-    "GalileoConfig",
-    "DINOv3",
-    "DINOv3Config",
-    "Terramind",
-    "TerramindConfig",
-    "Satlas",
-    "SatlasConfig",
-    "Croma",
-    "CromaConfig",
-    "Clay",
-    "ClayConfig",
-    "PrestoWrapper",
-    "PrestoConfig",
-    "AnySat",
-    "AnySatConfig",
-    "Tessera",
-    "TesseraConfig",
-    "PrithviV2",
-    "PrithviV2Config",
-]
+__all__ = ["BaselineModelName", "models_with_multiple_sizes", "get_launch_script_path", *_LAZY]

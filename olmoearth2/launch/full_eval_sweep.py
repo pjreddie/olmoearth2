@@ -14,10 +14,13 @@ from typing import Any
 
 from olmoearth2.eval.datasets.configs import dataset_to_config, get_eval_mode
 from olmoearth2.eval.models import (
-    MODELS_WITH_MULTIPLE_SIZES,
     BaselineModelName,
     get_launch_script_path,
+    models_with_multiple_sizes,
 )
+
+# Resolved once at import (sweep scripts may use the eval extras).
+MODELS_WITH_MULTIPLE_SIZES = models_with_multiple_sizes()
 from olmoearth2.launch.all_evals import EVAL_TASKS
 from olmoearth2.launch.constants import (
     CHECKPOINT_SWEEP_LAUNCH_PATH,

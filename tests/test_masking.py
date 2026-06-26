@@ -35,7 +35,13 @@ def _make_batch(b=6, h=8, w=8, t=6):
 
 
 def _apply():
+    import random as _random
+
+    import numpy as _np
+
     torch.manual_seed(0)
+    _np.random.seed(0)
+    _random.seed(0)
     batch = _make_batch()
     strat = RandomTimeWithDecodeMaskingStrategy(
         encode_ratio=0.5,
